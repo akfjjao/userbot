@@ -158,6 +158,12 @@ def init_db():
             if DATABASE_URL:
                 # Postgres
                 c.execute("""
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                """)
+                c.execute("""
                     CREATE TABLE IF NOT EXISTS target_pairs (
                         id SERIAL PRIMARY KEY,
                         source_id BIGINT,

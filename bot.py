@@ -1107,6 +1107,93 @@ async def get_topic_selection_markup(chat_id, prefix):
 # -----------------------------
 # Userbot Logic
 # -----------------------------
+
+async def get_chat_selection_markup(prefix, page=0):
+    markup = InlineKeyboardMarkup(row_width=1)
+    if not userbot or not userbot.is_connected():
+        return None
+    
+    chats = []
+    # Fetch enough dialogs to populate selection
+    async for dialog in userbot.iter_dialogs(limit=100):
+        entity = dialog.entity
+        # Filter for relevant chat types
+        if isinstance(entity, (types.Chat, types.Channel, types.User)):
+            chats.append(dialog)
+    
+    # Pagination
+    start = page * 10
+    end = start + 10
+    page_items = chats[start:end]
+    
+    for dialog in page_items:
+        chat = dialog.entity
+        is_forum = getattr(chat, "forum", False)
+        
+        # Better visual distinction
+        if isinstance(chat, types.Channel):
+            if is_forum:
+                icon = "🏛️"
+                title = f"『 TOPIC 』 {chat.title}"
+            elif chat.broadcast:
+                icon = "📢"
+                title = chat.title or "Channel"
+            else:
+                icon = "👥"
+                title = chat.title or "Group"
+        elif isinstance(chat, types.Chat):
+            icon = "👥"
+            title = chat.title or "Group"
+        elif isinstance(chat, types.User):
+            if chat.bot: icon = "🤖"
+            else: icon = "👤"
+            title = f"{chat.first_name or ''} {chat.last_name or ''}".strip() or "Private Chat"
+        else:
+            icon = "💬"
+            title = "Unknown"
+
+        markup.add(
+            InlineKeyboardButton(
+                f"{icon} {title}",
+                callback_data=f"{prefix}_{chat.id}"
+            )
+        )
+    
+    nav = []
+    if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"{prefix}_page_{page-1}"))
+    if end < len(chats): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"{prefix}_page_{page+1}"))
+    if nav: markup.add(*nav)
+    
+    markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="pairs_main"))
+    return markup
+
+
+def user_account_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("👥 Groups", callback_data="user_acc_list_groups_0"),
+        InlineKeyboardButton("📢 Channels", callback_data="user_acc_list_channels_0")
+    )
+    markup.add(
+        InlineKeyboardButton("👤 Private", callback_data="user_acc_list_private_0"),
+        InlineKeyboardButton("🤖 Bots", callback_data="user_acc_list_bots_0")
+    )
+    markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
+    return markup
+
+
+def banlist_markup():
+    markup = InlineKeyboardMarkup(row_width=1)
+    banned = get_banned_users()
+    for uid, uname in banned:
+        identifier = uid if uid else uname
+        label = f"🚫 {uname if uname else uid}"
+        markup.add(InlineKeyboardButton(label, callback_data=f"unban_confirm_{identifier}"))
+    
+    markup.add(InlineKeyboardButton("➕ Add to Ban List", callback_data="ban_add_start"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
+    return markup
+
 async def get_or_create_target_topic(client, target_chat_id, topic_title, source_chat_id=None, source_topic_id=None, icon_emoji_id=None):
     """
     Search for a topic by title in target chat. If not found, create it.

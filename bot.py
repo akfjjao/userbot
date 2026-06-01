@@ -846,6 +846,25 @@ def fetch_logged_media(bot_id, limit=1000):
         c.execute(f"SELECT source_chat_id, source_msg_id, file_id, media_type, caption FROM log_media WHERE bot_id = {p} ORDER BY timestamp DESC LIMIT {p}", (bot_id, limit))
         return c.fetchall()
 
+def get_total_vaulted_count():
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM log_media")
+        return c.fetchone()[0] or 0
+
+def get_all_vault_stats():
+    with db_conn() as conn:
+        c = conn.cursor()
+        query = """
+            SELECT m.source_chat_id, COALESCE(p.source_title, 'Direct/Private'), COUNT(m.id) as item_count
+            FROM log_media m
+            LEFT JOIN target_pairs p ON m.source_chat_id = p.source_id
+            GROUP BY m.source_chat_id, p.source_title
+            ORDER BY item_count DESC
+        """
+        c.execute(query)
+        return c.fetchall()
+
 # -----------------------------
 # Global State
 # -----------------------------
@@ -887,13 +906,22 @@ def get_dashboard_markup():
     
     if is_online:
         markup.add(InlineKeyboardButton("🎯 Target Pairs", callback_data="pairs_main"))
-        markup.add(InlineKeyboardButton("🚀 Release from Vault", callback_data="vault_rel_main"))
         markup.add(InlineKeyboardButton("👤 User Account", callback_data="user_acc_main"))
-        markup.add(InlineKeyboardButton("📜 Log Bots", callback_data="log_bot_main"))
+        markup.add(InlineKeyboardButton("🔒 Vault Console", callback_data="vault_main"))
         markup.add(InlineKeyboardButton("🚫 Ban List", callback_data="banlist_main"))
     else:
         markup.add(InlineKeyboardButton("🔌 Connect Userbot", callback_data="user_connect_start"))
     
+    return markup
+
+def vault_console_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🚀 Release from Vault", callback_data="vault_rel_main"),
+        InlineKeyboardButton("➕ Add Vault Bot", callback_data="log_bot_add_start")
+    )
+    markup.add(InlineKeyboardButton("🤖 Manage Vault Bots", callback_data="log_bot_main"))
+    markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
     return markup
 
 def log_bot_list_markup():
@@ -901,10 +929,10 @@ def log_bot_list_markup():
     bots = get_log_bots()
     for token, username, bot_id in bots:
         stats = get_logged_media_stats(bot_id)
-        markup.add(InlineKeyboardButton(f"🤖 @{username} ({stats})", callback_data=f"log_bot_view_{bot_id}"))
+        markup.add(InlineKeyboardButton(f"🤖 @{username} ({stats} items)", callback_data=f"log_bot_view_{bot_id}"))
     
-    markup.add(InlineKeyboardButton("➕ Add Log Bot", callback_data="log_bot_add_start"))
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
+    markup.add(InlineKeyboardButton("➕ Add Vault Bot", callback_data="log_bot_add_start"))
+    markup.add(InlineKeyboardButton("🔙 Back to Vault Console", callback_data="vault_main"))
     return markup
 
 def log_bot_view_markup(bot_id):
@@ -1105,8 +1133,10 @@ async def get_topic_selection_markup(chat_id, prefix):
         return None
     
     try:
+        # Force entity resolution first to avoid ChannelInvalidError / PeerIdInvalidError
+        entity = await resolve_target_id(userbot, chat_id)
         result = await userbot(functions.channels.GetForumTopicsRequest(
-            channel=chat_id,
+            channel=entity,
             offset_date=0,
             offset_id=0,
             offset_topic=0,
@@ -1120,17 +1150,17 @@ async def get_topic_selection_markup(chat_id, prefix):
             # Even if no topics found, allow selecting the whole group
             markup.add(InlineKeyboardButton("🏢 Select Entire Group", callback_data=f"{prefix}_{chat_id}_0"))
         else:
-            # Add option to select the entire group as a source
+            # Add option to select the entire group as a source/target
             markup.add(InlineKeyboardButton("🏢 Select Entire Group", callback_data=f"{prefix}_{chat_id}_0"))
             for topic in topics:
-                # Telethon Forum topics: top_message is the anchor/starter message ID
-                topic_anchor_id = getattr(topic, "top_message", None)
-                topic_title = getattr(topic, "title", f"Topic {topic_anchor_id}")
-                if topic_anchor_id:
+                # Telethon Forum topics: 'id' is the permanent topic starter/anchor message ID
+                topic_id = getattr(topic, "id", None)
+                topic_title = getattr(topic, "title", f"Topic {topic_id}")
+                if topic_id:
                     markup.add(
                         InlineKeyboardButton(
                             f"🧵 {topic_title}",
-                            callback_data=f"{prefix}_{chat_id}_{topic_anchor_id}"
+                            callback_data=f"{prefix}_{chat_id}_{topic_id}"
                         )
                     )
                     
@@ -1170,8 +1200,10 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
     
     # 3) Fetch Topics from Telegram
     try:
+        # Force entity resolution first to avoid ChannelInvalidError / PeerIdInvalidError
+        target_chat = await resolve_target_id(client, t_chat_id)
         result = await client(functions.channels.GetForumTopicsRequest(
-            channel=t_chat_id,
+            channel=target_chat,
             offset_date=0,
             offset_id=0,
             offset_topic=0,
@@ -1182,7 +1214,7 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
             topic_cache[t_chat_id] = {}
             
         for topic in result.topics:
-            topic_cache[t_chat_id][topic.title.lower().strip()] = topic.top_message
+            topic_cache[t_chat_id][topic.title.lower().strip()] = topic.id
             
         if title_key in topic_cache[t_chat_id]:
             res = topic_cache[t_chat_id][title_key]
@@ -1193,18 +1225,18 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
         # 4) Create if not found
         logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id} (Icon: {icon_emoji_id})")
         created = await client(functions.channels.CreateForumTopicRequest(
-            channel=t_chat_id,
+            channel=target_chat,
             title=topic_title,
             icon_emoji_id=int(icon_emoji_id) if icon_emoji_id else None
         ))
         
         await asyncio.sleep(1)
         res_after = await client(functions.channels.GetForumTopicsRequest(
-            channel=t_chat_id,
+            channel=target_chat,
             offset_date=0, offset_id=0, offset_topic=0, limit=20
         ))
         for t in res_after.topics:
-            topic_cache[t_chat_id][t.title.lower().strip()] = t.top_message
+            topic_cache[t_chat_id][t.title.lower().strip()] = t.id
             
         final_id = topic_cache[t_chat_id].get(title_key)
         if final_id and source_chat_id and source_topic_id:
@@ -1727,17 +1759,44 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id)
         bot.edit_message_text(get_dashboard_text(), call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup(), parse_mode="Markdown")
 
+    elif data == "vault_main":
+        bot.answer_callback_query(call.id)
+        bots = get_log_bots()
+        total_vaulted = get_total_vaulted_count()
+        group_stats = get_all_vault_stats()
+        
+        text = "🔒 **VAULT CONSOLE**\n\n"
+        text += "🤖 **Active Vault Bots:**\n"
+        if bots:
+            for token, username, bot_id in bots:
+                stats = get_logged_media_stats(bot_id)
+                text += f"• @{username} (`{stats}` items)\n"
+        else:
+            text += "• _No vault bots added._\n"
+            
+        text += f"\n📦 **Total Vaulted Content:** `{total_vaulted}` items\n\n"
+        
+        text += "📁 **Breakdown by Source Group:**\n"
+        if group_stats:
+            for sid, title, count in group_stats:
+                if sid == 0 or not sid: continue
+                text += f"• `{title}`: `{count}` items\n"
+        else:
+            text += "• _No vaulted content breakdown available._\n"
+            
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=vault_console_markup(), parse_mode="Markdown")
+
     elif data == "vault_rel_main":
         bot.answer_callback_query(call.id)
         sources = get_vault_sources()
         if not sources:
-            bot.edit_message_text("❌ No vaulted media found. Make sure you have collected media and set up a Log Target.", call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup())
+            bot.edit_message_text("❌ No vaulted media found. Make sure you have collected media and set up a Log Target.", call.message.chat.id, call.message.message_id, reply_markup=vault_console_markup())
             return
             
         markup = InlineKeyboardMarkup(row_width=1)
         for sid, title in sources:
             markup.add(InlineKeyboardButton(f"📁 {title}", callback_data=f"vault_src_{sid}"))
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data="vault_main"))
         
         bot.edit_message_text("🚀 **Vault Release Engine**\n\nSelect the source group you want to release media for:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 

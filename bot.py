@@ -1573,87 +1573,140 @@ def setup_automation_handlers(client: TelegramClient):
             logger.info(f"🚫 BLOCKED: Ignored message from banned user {sender_id} (@{sender_username})")
             return
 
-        pairs = get_target_pairs()
-        for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
-            # Normalize ID matching
-            source_id_str = str(sid).replace("-100", "")
-            msg_id_str = str(m.chat_id).replace("-100", "")
-
-            if source_id_str == msg_id_str:
-                # --- TOPIC DETECTION ---
-                msg_topic_anchor = None
-                if m.reply_to:
-                    msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
+        # --- ALBUM / SINGLE MESSAGE SPLIT ---
+        if m.grouped_id:
+            if m.grouped_id not in album_cache:
+                album_cache[m.grouped_id] = [m]
                 
-                if not msg_topic_anchor and getattr(m, 'forum_topic', False):
-                    msg_topic_anchor = m.id
-                
-                if not msg_topic_anchor and m.reply_to_msg_id:
-                    msg_topic_anchor = m.reply_to_msg_id
+                # Single album delayed task that processes all matching pairs chronological
+                async def delayed_send_album(gid, s_id):
+                    await asyncio.sleep(5.0)
+                    messages = album_cache.pop(gid, [])
+                    if not messages: return
+                    
+                    pairs = get_target_pairs()
+                    already_vaulted = False
+                    
+                    for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
+                        source_id_str = str(sid).replace("-100", "")
+                        target_id_str = str(s_id).replace("-100", "")
+                        
+                        if source_id_str == target_id_str:
+                            # --- TOPIC DETECTION ---
+                            first_msg = messages[0]
+                            msg_topic_anchor = None
+                            if first_msg.reply_to:
+                                msg_topic_anchor = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+                            if not msg_topic_anchor and getattr(first_msg, 'forum_topic', False):
+                                msg_topic_anchor = first_msg.id
+                            if not msg_topic_anchor and first_msg.reply_to_msg_id:
+                                msg_topic_anchor = first_msg.reply_to_msg_id
 
-                # --- CONTENT FILTERING ---
-                cf_val = cf or "everything"
-                if cf_val == "media" and not m.media:
-                    continue
-                if cf_val == "text" and m.media:
-                    continue
+                            topic_filter_id = None
+                            if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
+                                try: topic_filter_id = int(s_topic)
+                                except: pass
+                            
+                            if topic_filter_id is not None:
+                                if str(msg_topic_anchor) != str(topic_filter_id):
+                                    continue
 
-                # Specific topic filtering
-                topic_filter_id = None
-                if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
-                    try:
-                        topic_filter_id = int(s_topic)
-                    except:
-                        pass
+                            # --- CONTENT FILTERING ---
+                            cf_val = cf or "everything"
+                            if cf_val == "media" and not any(msg.media for msg in messages):
+                                continue
+                            if cf_val == "text" and any(msg.media for msg in messages):
+                                continue
+                                
+                            # --- MONITOR: SAVE TO DB ---
+                            if is_mon:
+                                with db_conn() as conn:
+                                    c = conn.cursor()
+                                    for msg in messages:
+                                        m_type = get_specific_media_type(msg.media)
+                                        if USING_POSTGRES:
+                                            c.execute(
+                                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'monitor') ON CONFLICT DO NOTHING",
+                                                (pid, sid, msg.id, m_type, msg.message or "")
+                                            )
+                                        else:
+                                            c.execute(
+                                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'monitor')",
+                                                (pid, sid, msg.id, m_type, msg.message or "")
+                                            )
+
+                            # --- LIVE FORWARD: SEND TO TARGET ---
+                            if is_live:
+                                await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid)
+                                
+                            # --- MONITOR: VAULT TO LOG BOTS (once per album execution) ---
+                            if is_mon and not already_vaulted:
+                                asyncio.create_task(forward_to_log_bots(client, messages, sid))
+                                already_vaulted = True
                 
-                if topic_filter_id is not None:
-                    if str(msg_topic_anchor) != str(topic_filter_id):
+                asyncio.create_task(delayed_send_album(m.grouped_id, m.chat_id))
+            else:
+                album_cache[m.grouped_id].append(m)
+        else:
+            # Single Message Flow
+            pairs = get_target_pairs()
+            already_vaulted = False
+            for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
+                source_id_str = str(sid).replace("-100", "")
+                msg_id_str = str(m.chat_id).replace("-100", "")
+
+                if source_id_str == msg_id_str:
+                    # --- TOPIC DETECTION ---
+                    msg_topic_anchor = None
+                    if m.reply_to:
+                        msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
+                    
+                    if not msg_topic_anchor and getattr(m, 'forum_topic', False):
+                        msg_topic_anchor = m.id
+                    
+                    if not msg_topic_anchor and m.reply_to_msg_id:
+                        msg_topic_anchor = m.reply_to_msg_id
+
+                    # --- CONTENT FILTERING ---
+                    cf_val = cf or "everything"
+                    if cf_val == "media" and not m.media:
+                        continue
+                    if cf_val == "text" and m.media:
                         continue
 
-                # --- LOGGING & COLLECTION LOGIC (is_mon) ---
-                if is_mon:
-                    m_type = get_specific_media_type(m.media)
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        if USING_POSTGRES:
-                            c.execute(
-                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'monitor') ON CONFLICT DO NOTHING",
-                                (pid, sid, m.id, m_type, m.message or "")
-                            )
-                        else:
-                            c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'monitor')",
-                                (pid, sid, m.id, m_type, m.message or "")
-                            )
+                    topic_filter_id = None
+                    if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
+                        try: topic_filter_id = int(s_topic)
+                        except: pass
+                    
+                    if topic_filter_id is not None:
+                        if str(msg_topic_anchor) != str(topic_filter_id):
+                            continue
 
-                # --- ALBUM / SINGLE MESSAGE LOGIC ---
-                if m.grouped_id:
-                    if m.grouped_id not in album_cache:
-                        album_cache[m.grouped_id] = [m]
-                        # Wait for all parts
-                        async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic, is_monitoring, live_forward):
-                            await asyncio.sleep(5.0) 
-                            messages = album_cache.pop(gid, [])
-                            if messages:
-                                if live_forward:
-                                    await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
-                                if is_monitoring:
-                                    # Send the entire album to log bots (Vaulting)
-                                    asyncio.create_task(forward_to_log_bots(client, messages, s_id))
-                        asyncio.create_task(delayed_send(m.grouped_id, tid, is_mir, sid, t_topic, is_mon, is_live))
-                    else:
-                        album_cache[m.grouped_id].append(m)
-                else:
+                    # --- MONITOR: SAVE TO DB ---
+                    if is_mon:
+                        m_type = get_specific_media_type(m.media)
+                        with db_conn() as conn:
+                            c = conn.cursor()
+                            if USING_POSTGRES:
+                                c.execute(
+                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'monitor') ON CONFLICT DO NOTHING",
+                                    (pid, sid, m.id, m_type, m.message or "")
+                                )
+                            else:
+                                c.execute(
+                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'monitor')",
+                                    (pid, sid, m.id, m_type, m.message or "")
+                                )
+
+                    # --- LIVE FORWARD: SEND TO TARGET ---
                     if is_live:
                         await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
-                    if is_mon:
+                    
+                    # --- MONITOR: VAULT TO LOG BOTS (once per message execution) ---
+                    if is_mon and not already_vaulted:
                         asyncio.create_task(forward_to_log_bots(client, [m], sid))
-                
-                # CRITICAL: Break the pair loop once the message is handled to prevent duplication
-                break
-# -----------------------------
-# Bot Handlers
-# -----------------------------
+                        already_vaulted = True
 @bot.message_handler(commands=['start', 'dash'])
 def cmd_start(message):
     if message.from_user.id != ADMIN_ID:

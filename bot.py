@@ -2540,7 +2540,21 @@ def handle_state_inputs(message):
         if not text.isdigit():
             bot.reply_to(message, "Invalid API ID. Please send a numeric ID.")
             return
-        login_data[uid] = {"api_id": int(text)}
+        api_id_val = int(text)
+        if api_id_val > 2147483647 or api_id_val < 0:
+            bot.reply_to(
+                message, 
+                "⚠️ **Invalid API ID!**\n\n"
+                "The number you entered exceeds the 32-bit integer limit (2,147,483,647). This usually happens if you accidentally enter:\n"
+                "• Your **Telegram User ID** (e.g., `8881447083`)\n"
+                "• Your **Phone Number**\n"
+                "• A **Bot Token** prefix\n\n"
+                "Please get your actual **API ID** (which is a 7 to 8 digit number, e.g., `28956432`) from [my.telegram.org](https://my.telegram.org/apps) and send it again.",
+                parse_mode="Markdown",
+                disable_web_page_preview=True
+            )
+            return
+        login_data[uid] = {"api_id": api_id_val}
         admin_states[uid] = "awaiting_api_hash"
         bot.send_message(message.chat.id, "Step 2: Please send your *API HASH*.", parse_mode="Markdown")
 

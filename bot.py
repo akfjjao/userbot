@@ -1017,10 +1017,17 @@ def pair_view_markup(pair_id, show_mirror=False):
     markup = InlineKeyboardMarkup(row_width=2)
     
     mon_btn = "🛑 Stop Monitor" if is_mon else "👁️ Monitor"
+    live_btn = "🛑 Stop Live" if is_live else "⚡ Live Forward"
+    mir_btn = "🛑 Stop Mirror" if is_mir else "🔀 Mirror Mode"
     
     markup.add(
-        InlineKeyboardButton(mon_btn, callback_data=f"pair_toggle_mon_{pair_id}")
+        InlineKeyboardButton(mon_btn, callback_data=f"pair_toggle_mon_{pair_id}"),
+        InlineKeyboardButton(live_btn, callback_data=f"pair_toggle_live_{pair_id}")
     )
+    
+    # Mirror mode button ONLY appears if both chats are topic-enabled (forums)
+    if show_mirror:
+        markup.add(InlineKeyboardButton(mir_btn, callback_data=f"pair_toggle_mir_{pair_id}"))
     
     # Content Filter Button
     cf = pair[10] or "everything"
@@ -1057,18 +1064,6 @@ def pair_view_markup(pair_id, show_mirror=False):
     markup.add(InlineKeyboardButton("🗑 Delete Pair", callback_data=f"pair_delete_confirm_{pair_id}"))
     markup.add(InlineKeyboardButton("🔙 Back to Pairs", callback_data="pairs_main"))
     return markup
-def banlist_markup():
-    markup = InlineKeyboardMarkup(row_width=1)
-    banned = get_banned_users()
-    for uid, uname in banned:
-        identifier = uid if uid else uname
-        label = f"🚫 {uname if uname else uid}"
-        markup.add(InlineKeyboardButton(label, callback_data=f"unban_confirm_{identifier}"))
-    
-    markup.add(InlineKeyboardButton("➕ Add to Ban List", callback_data="ban_add_start"))
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
-    return markup
-
 async def get_chat_selection_markup(prefix, page=0):
     markup = InlineKeyboardMarkup(row_width=1)
     if not userbot or not userbot.is_connected():
@@ -1560,9 +1555,6 @@ def setup_automation_handlers(client: TelegramClient):
 
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
-            if not is_mon:
-                continue
-
             # Normalize ID matching
             source_id_str = str(sid).replace("-100", "")
             msg_id_str = str(m.chat_id).replace("-100", "")
@@ -1598,55 +1590,44 @@ def setup_automation_handlers(client: TelegramClient):
                     if str(msg_topic_anchor) != str(topic_filter_id):
                         continue
 
-                # --- LOGGING & COLLECTION LOGIC ---
-                # Save to database (normally)
-                m_type = get_specific_media_type(m.media)
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    if USING_POSTGRES:
-                        c.execute(
-                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pid, sid, m.id, m_type, m.message or "")
-                        )
-                    else:
-                        c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                            (pid, sid, m.id, m_type, m.message or "")
-                        )
-
-                # Determine if BOTH chats are forums to automatically mirror topics
-                auto_mirror = False
-                try:
-                    real_sid = sid if str(sid).startswith("-100") else int(f"-100{str(sid).replace('-100', '')}")
-                    real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
-                    src_ent = await client.get_entity(real_sid)
-                    tgt_ent = await client.get_entity(real_tid)
-                    if getattr(src_ent, 'forum', False) and getattr(tgt_ent, 'forum', False):
-                        auto_mirror = True
-                except:
-                    pass
+                # --- LOGGING & COLLECTION LOGIC (is_mon) ---
+                if is_mon:
+                    m_type = get_specific_media_type(m.media)
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        if USING_POSTGRES:
+                            c.execute(
+                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                                (pid, sid, m.id, m_type, m.message or "")
+                            )
+                        else:
+                            c.execute(
+                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                                (pid, sid, m.id, m_type, m.message or "")
+                            )
 
                 # --- ALBUM / SINGLE MESSAGE LOGIC ---
                 if m.grouped_id:
                     if m.grouped_id not in album_cache:
                         album_cache[m.grouped_id] = [m]
                         # Wait for all parts
-                        async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic, s_chat_id):
+                        async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic, is_monitoring, live_forward):
                             await asyncio.sleep(5.0) 
                             messages = album_cache.pop(gid, [])
                             if messages:
-                                # Mirror/forward normally to target group
-                                await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
-                                # Send the entire album to log bots (Vaulting)
-                                asyncio.create_task(forward_to_log_bots(client, messages, s_chat_id))
-                        asyncio.create_task(delayed_send(m.grouped_id, tid, auto_mirror, sid, t_topic, sid))
+                                if live_forward:
+                                    await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
+                                if is_monitoring:
+                                    # Send the entire album to log bots (Vaulting)
+                                    asyncio.create_task(forward_to_log_bots(client, messages, s_id))
+                        asyncio.create_task(delayed_send(m.grouped_id, tid, is_mir, sid, t_topic, is_mon, is_live))
                     else:
                         album_cache[m.grouped_id].append(m)
                 else:
-                    # Mirror/forward normally to target group
-                    await send_mirrored_content(client, tid, [m], t_topic, auto_mirror, sid)
-                    # Forward to log bots (Vaulting)
-                    asyncio.create_task(forward_to_log_bots(client, [m], sid))
+                    if is_live:
+                        await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
+                    if is_mon:
+                        asyncio.create_task(forward_to_log_bots(client, [m], sid))
                 
                 # CRITICAL: Break the pair loop once the message is handled to prevent duplication
                 break
@@ -2862,16 +2843,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
             grouped_batches.append(temp_group)
 
         # Determine if BOTH chats are forums to automatically mirror topics
-        auto_mirror = False
-        try:
-            real_sid = sid if str(sid).startswith("-100") else int(f"-100{str(sid).replace('-100', '')}")
-            real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
-            src_ent = await userbot.get_entity(real_sid)
-            tgt_ent = await userbot.get_entity(real_tid)
-            if getattr(src_ent, 'forum', False) and getattr(tgt_ent, 'forum', False):
-                auto_mirror = True
-        except:
-            pass
+        auto_mirror = is_mir
 
         # Save and forward both normally and through vault
         for batch in grouped_batches:

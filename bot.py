@@ -1566,6 +1566,10 @@ def setup_automation_handlers(client: TelegramClient):
         m = event.message
         if not m: return
 
+        # Ignore all outgoing messages sent by the userbot itself to prevent loops and media leakage
+        if m.out:
+            return
+
         # --- BAN LIST CHECK ---
         sender_id = m.sender_id
         sender_username = getattr(m.sender, 'username', None)

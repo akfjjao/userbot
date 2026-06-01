@@ -185,6 +185,8 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
             except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN added_by VARCHAR(50) DEFAULT 'monitor'")
+            except: pass
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS log_targets (
@@ -322,6 +324,8 @@ def init_db():
             try: c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN added_by TEXT DEFAULT 'monitor'")
             except: pass
 
             c.execute("""
@@ -992,8 +996,8 @@ async def show_pair_view(chat_id, message_id, pid):
         both_forums = False
         if userbot and userbot.is_connected():
             try:
-                s_chat = await userbot.get_entity(sid)
-                t_chat = await userbot.get_entity(tid)
+                s_chat = await resolve_target_id(userbot, sid)
+                t_chat = await resolve_target_id(userbot, tid)
                 both_forums = getattr(s_chat, "forum", False) and getattr(t_chat, "forum", False)
             except Exception as e:
                 logger.error(f"Forum check failed: {e}")
@@ -1035,15 +1039,14 @@ def pair_view_markup(pair_id, show_mirror=False):
     cf_text = cf_map.get(cf, "🔄 All Content")
     markup.add(InlineKeyboardButton(f"Filter: {cf_text}", callback_data=f"pair_toggle_filter_{pair_id}"))
     
-    # Retrieve unreleased category counts
-    photos, videos, files = get_pair_media_counts(pair_id)
+    # Retrieve unreleased source counts
+    mon, scr, col = get_pair_source_counts(pair_id)
+    total_pending = mon + scr + col
     
     # Check if a manual task is running
     is_hist = is_task_running(f"hist_{pair_id}")
     is_coll = is_task_running(f"coll_{pair_id}")
-    is_rel_photo = is_task_running(f"rel_photo_{pair_id}")
-    is_rel_video = is_task_running(f"rel_video_{pair_id}")
-    is_rel_file = is_task_running(f"rel_file_{pair_id}")
+    is_rel = is_task_running(f"rel_monitor_{pair_id}") or is_task_running(f"rel_scraper_{pair_id}") or is_task_running(f"rel_collection_{pair_id}")
     
     if is_hist: markup.add(InlineKeyboardButton("🛑 Stop History Scrape", callback_data=f"pair_stop_task_hist_{pair_id}"))
     else: markup.add(InlineKeyboardButton("📜 History Scraper", callback_data=f"pair_hist_menu_{pair_id}"))
@@ -1051,41 +1054,13 @@ def pair_view_markup(pair_id, show_mirror=False):
     if is_coll: markup.add(InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}"))
     else: markup.add(InlineKeyboardButton("📥 Collect Now", callback_data=f"pair_collect_{pair_id}"))
     
-    # Three separate release buttons
-    if is_rel_photo: markup.add(InlineKeyboardButton("🛑 Stop Photo Release", callback_data=f"pair_stop_task_rel_photo_{pair_id}"))
-    else: markup.add(InlineKeyboardButton(f"🖼️ Release Photos ({photos})", callback_data=f"pair_release_photo_{pair_id}"))
-    
-    if is_rel_video: markup.add(InlineKeyboardButton("🛑 Stop Video Release", callback_data=f"pair_stop_task_rel_video_{pair_id}"))
-    else: markup.add(InlineKeyboardButton(f"🎥 Release Videos ({videos})", callback_data=f"pair_release_video_{pair_id}"))
-    
-    if is_rel_file: markup.add(InlineKeyboardButton("🛑 Stop File Release", callback_data=f"pair_stop_task_rel_file_{pair_id}"))
-    else: markup.add(InlineKeyboardButton(f"📁 Release Files ({files})", callback_data=f"pair_release_file_{pair_id}"))
+    # Single Release Button showing total unreleased count
+    if is_rel: markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_monitor_{pair_id}")) # Fallback stop
+    else: markup.add(InlineKeyboardButton(f"🚀 Release Now ({total_pending})", callback_data=f"pair_release_{pair_id}"))
 
     markup.add(InlineKeyboardButton("🗑 Delete Pair", callback_data=f"pair_delete_confirm_{pair_id}"))
     markup.add(InlineKeyboardButton("🔙 Back to Pairs", callback_data="pairs_main"))
     return markup
-async def get_chat_selection_markup(prefix, page=0):
-    markup = InlineKeyboardMarkup(row_width=1)
-    if not userbot or not userbot.is_connected():
-        return None
-    
-    chats = []
-    # Fetch enough dialogs to populate selection
-    async for dialog in userbot.iter_dialogs(limit=100):
-        entity = dialog.entity
-        # Filter for relevant chat types
-        if isinstance(entity, (types.Chat, types.Channel, types.User)):
-            chats.append(dialog)
-    
-    # Pagination
-    start = page * 10
-    end = start + 10
-    page_items = chats[start:end]
-    
-    if not page_items:
-        markup.add(InlineKeyboardButton("❌ No Groups Found", callback_data="none"))
-        return markup
-        
     for dialog in page_items:
         chat = dialog.entity
         is_forum = getattr(chat, "forum", False)
@@ -1519,20 +1494,20 @@ def get_specific_media_type(media):
         return "file"
     return "file"
 
-def get_pair_media_counts(pair_id):
+def get_pair_source_counts(pair_id):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        # Photos
-        c.execute(f"SELECT COUNT(*) FROM collected_media WHERE pair_id = {p} AND media_type IN ('photo', 'MessageMediaPhoto') AND released = 0", (pair_id,))
-        photos = c.fetchone()[0] or 0
-        # Videos
-        c.execute(f"SELECT COUNT(*) FROM collected_media WHERE pair_id = {p} AND media_type = 'video' AND released = 0", (pair_id,))
-        videos = c.fetchone()[0] or 0
-        # Files (Documents / Audios / generic)
-        c.execute(f"SELECT COUNT(*) FROM collected_media WHERE pair_id = {p} AND media_type IN ('file', 'MessageMediaDocument') AND released = 0", (pair_id,))
-        files = c.fetchone()[0] or 0
-        return photos, videos, files
+        # Monitor
+        c.execute(f"SELECT COUNT(*) FROM collected_media WHERE pair_id = {p} AND COALESCE(added_by, 'monitor') = 'monitor' AND released = 0", (pair_id,))
+        mon = c.fetchone()[0] or 0
+        # Scraper
+        c.execute(f"SELECT COUNT(*) FROM collected_media WHERE pair_id = {p} AND COALESCE(added_by, 'monitor') = 'scraper' AND released = 0", (pair_id,))
+        scr = c.fetchone()[0] or 0
+        # Collection (Collect Now)
+        c.execute(f"SELECT COUNT(*) FROM collected_media WHERE pair_id = {p} AND COALESCE(added_by, 'monitor') = 'collection' AND released = 0", (pair_id,))
+        col = c.fetchone()[0] or 0
+        return mon, scr, col
 
 
 def setup_automation_handlers(client: TelegramClient):
@@ -1597,12 +1572,12 @@ def setup_automation_handlers(client: TelegramClient):
                         c = conn.cursor()
                         if USING_POSTGRES:
                             c.execute(
-                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'monitor') ON CONFLICT DO NOTHING",
                                 (pid, sid, m.id, m_type, m.message or "")
                             )
                         else:
                             c.execute(
-                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'monitor')",
                                 (pid, sid, m.id, m_type, m.message or "")
                             )
 
@@ -1784,8 +1759,8 @@ async def finalize_pair_task(call, uid):
 
         bot.edit_message_text("⏳ Resolving pair details...", call.message.chat.id, call.message.message_id)
         
-        s_chat = await userbot.get_entity(sid)
-        t_chat = await userbot.get_entity(tid)
+        s_chat = await resolve_target_id(userbot, sid)
+        t_chat = await resolve_target_id(userbot, tid)
         
         s_title = getattr(s_chat, 'title', None) or getattr(s_chat, 'first_name', None) or str(sid)
         t_title = getattr(t_chat, 'title', None) or getattr(t_chat, 'first_name', None) or str(tid)
@@ -2219,37 +2194,55 @@ def handle_callbacks(call):
         asyncio.run_coroutine_threadsafe(run_collection(call.message.chat.id, pid), loop)
 
     elif data.startswith("pair_release_"):
-        # Format: pair_release_{media_type}_{pid}
-        parts = data.split("_")
-        media_type = parts[2]
-        pid = int(parts[3])
+        pid = int(data.split("_")[-1])
         bot.answer_callback_query(call.id)
+        
+        # Retrieve counts
+        mon, scr, col = get_pair_source_counts(pid)
+        
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton(f"👁️ Release Monitor ({mon})", callback_data=f"pair_rel_src_monitor_{pid}"),
+            InlineKeyboardButton(f"📜 Release Scraper ({scr})", callback_data=f"pair_rel_src_scraper_{pid}"),
+            InlineKeyboardButton(f"📥 Release Collect Now ({col})", callback_data=f"pair_rel_src_collection_{pid}"),
+            InlineKeyboardButton("🔙 Back to Pair", callback_data=f"pair_view_{pid}")
+        )
+        bot.edit_message_text("🚀 *Release Vault Items*\n\nChoose which collection source to release:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("pair_rel_src_"):
+        parts = data.split("_")
+        # Structure: pair_rel_src_{source_type}_{pid}
+        source_type = parts[3]
+        pid = int(parts[4])
+        bot.answer_callback_query(call.id)
+        
         markup = InlineKeyboardMarkup(row_width=2)
         markup.add(
-            InlineKeyboardButton("⚡ Instant Release", callback_data=f"pair_rel_now_{media_type}_{pid}"),
-            InlineKeyboardButton("⏰ Scheduled (Slow)", callback_data=f"pair_rel_slow_{media_type}_{pid}")
+            InlineKeyboardButton("⚡ Instant Release", callback_data=f"pair_rel_now_{source_type}_{pid}"),
+            InlineKeyboardButton("⏰ Scheduled (Slow)", callback_data=f"pair_rel_slow_{source_type}_{pid}")
         )
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"pair_view_{pid}"))
-        m_names = {"photo": "Photos 🖼️", "video": "Videos 🎥", "file": "Files/Docs 📁"}
-        display_name = m_names.get(media_type, "Media")
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"pair_release_{pid}"))
+        
+        m_names = {"monitor": "Monitor 👁️", "scraper": "History Scraper 📜", "collection": "Collect Now 📥"}
+        display_name = m_names.get(source_type, "Vault Items")
         bot.edit_message_text(f"🚀 *Release Engine: {display_name}*\n\nChoose release mode:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
     elif data.startswith("pair_rel_now_"):
         parts = data.split("_")
-        # Format: pair_rel_now_{media_type}_{pid}
-        media_type = parts[3]
+        # Structure: pair_rel_now_{source_type}_{pid}
+        source_type = parts[3]
         pid = int(parts[4])
-        bot.answer_callback_query(call.id, f"🚀 Starting Instant {media_type.capitalize()} Release...")
-        asyncio.run_coroutine_threadsafe(run_release(call.message.chat.id, pid, media_type=media_type, interval=1.5), loop)
+        bot.answer_callback_query(call.id, f"🚀 Starting Instant Release...")
+        asyncio.run_coroutine_threadsafe(run_release(call.message.chat.id, pid, added_by=source_type, interval=1.5), loop)
         asyncio.run_coroutine_threadsafe(show_pair_view(call.message.chat.id, call.message.message_id, pid), loop)
 
     elif data.startswith("pair_rel_slow_"):
         parts = data.split("_")
-        # Format: pair_rel_slow_{media_type}_{pid}
-        media_type = parts[3]
+        # Structure: pair_rel_slow_{source_type}_{pid}
+        source_type = parts[3]
         pid = int(parts[4])
         bot.answer_callback_query(call.id)
-        admin_states[uid] = f"rel_setup_interval_{media_type}_{pid}"
+        admin_states[uid] = f"rel_src_setup_interval_{source_type}_{pid}"
         bot.send_message(call.message.chat.id, "⏰ *Slow Release Setup*\n\nEnter the *interval* between items in seconds:\n(Example: `60` for 1 minute, `300` for 5 minutes)")
     elif data.startswith("pair_delete_confirm_"):
         pid = int(data.split("_")[-1])
@@ -2506,15 +2499,20 @@ def handle_state_inputs(message):
                 admin_states.pop(uid, None)
         asyncio.run_coroutine_threadsafe(verify_password_task(), loop)
 
-    elif state.startswith("rel_setup_interval_"):
-        # Format: rel_setup_interval_{media_type}_{pid}
+    elif state.startswith("rel_src_setup_interval_"):
+        # Format: rel_src_setup_interval_{source_type}_{pid}
         parts = state.split("_")
-        media_type = parts[3]
-        pid = int(parts[4])
+        source_type = parts[4]
+        pid = int(parts[5])
         if not text.isdigit():
             bot.reply_to(message, "Please send a number.")
             return
         interval = int(text)
+        admin_states.pop(uid)
+        m_names = {"monitor": "Monitor", "scraper": "History Scraper", "collection": "Collect Now"}
+        display_name = m_names.get(source_type, "Vault Items")
+        bot.send_message(message.chat.id, f"🚀 *Slow Release Started*\nPair: `{pid}` | Source: `{display_name}` | Interval: `{interval}s`")
+        asyncio.run_coroutine_threadsafe(run_release(message.chat.id, pid, added_by=source_type, interval=interval), loop)
         admin_states.pop(uid)
         m_names = {"photo": "Photos", "video": "Videos", "file": "Files"}
         display_name = m_names.get(media_type, "Media")
@@ -2682,12 +2680,12 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                             c = conn.cursor()
                             if USING_POSTGRES:
                                 c.execute(
-                                    "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'collection') ON CONFLICT DO NOTHING",
                                     (pair_id, sid_resolved, m.id, m_type, m.message or "")
                                 )
                             else:
                                 c.execute(
-                                    "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'collection')",
                                     (pair_id, sid_resolved, m.id, m_type, m.message or "")
                                 )
                 # Send the entire batch to log bots (vaulting)
@@ -2895,13 +2893,13 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     finally:
         running_tasks.pop(task_key, None)
 
-async def run_release(admin_chat_id, pair_id, media_type=None, interval=1.2):
+async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2):
     is_ok, msg = await ensure_userbot()
     if not is_ok:
         bot.send_message(admin_chat_id, f"❌ Userbot error: {msg}")
         return
 
-    task_key = f"rel_{media_type}_{pair_id}" if media_type else f"rel_{pair_id}"
+    task_key = f"rel_{added_by}_{pair_id}" if added_by else f"rel_{pair_id}"
     running_tasks[task_key] = True
     
     try:
@@ -2922,18 +2920,18 @@ async def run_release(admin_chat_id, pair_id, media_type=None, interval=1.2):
             bot.send_message(admin_chat_id, f"❌ Connection Error: {e}\n\nMake sure the bot is a member of both chats.")
             return
 
-        # Map media_type filter for query backward compatibility
+        # Map added_by filter for query backward compatibility
         media_filter = ""
-        category_name = "Media"
-        if media_type == "photo":
-            media_filter = "AND media_type IN ('photo', 'MessageMediaPhoto')"
-            category_name = "Photos"
-        elif media_type == "video":
-            media_filter = "AND media_type = 'video'"
-            category_name = "Videos"
-        elif media_type == "file":
-            media_filter = "AND media_type IN ('file', 'MessageMediaDocument')"
-            category_name = "Files"
+        category_name = "Collected Items"
+        if added_by == "monitor":
+            media_filter = "AND COALESCE(added_by, 'monitor') = 'monitor'"
+            category_name = "Monitor"
+        elif added_by == "scraper":
+            media_filter = "AND COALESCE(added_by, 'monitor') = 'scraper'"
+            category_name = "History Scraper"
+        elif added_by == "collection":
+            media_filter = "AND COALESCE(added_by, 'monitor') = 'collection'"
+            category_name = "Collect Now"
 
         with db_conn() as conn:
             c = conn.cursor()
@@ -2942,13 +2940,13 @@ async def run_release(admin_chat_id, pair_id, media_type=None, interval=1.2):
             items = c.fetchall()
         
         if not items:
-            bot.send_message(admin_chat_id, f"No pending {category_name.lower()} to release.")
+            bot.send_message(admin_chat_id, f"No pending items from {category_name} to release.")
             return
 
         sent = 0
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{media_type}_{pair_id}" if media_type else f"pair_stop_task_rel_{pair_id}"))
-        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` {category_name.lower()}...", reply_markup=markup)
+        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{added_by}_{pair_id}" if added_by else f"pair_stop_task_rel_{pair_id}"))
+        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items from {category_name}...", reply_markup=markup)
         
         for row_id, smid in items:
             if not running_tasks.get(task_key): break
@@ -3030,7 +3028,7 @@ async def run_release(admin_chat_id, pair_id, media_type=None, interval=1.2):
             except Exception as e:
                 logger.error(f"Release error: {e}")
 
-        bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` {category_name.lower()}.")
+        bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items from {category_name}.")
     except Exception as e:
         logger.error(f"Global Release Error: {e}")
         bot.send_message(admin_chat_id, f"❌ Release Crashed: {e}")

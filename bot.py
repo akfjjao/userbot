@@ -1017,17 +1017,10 @@ def pair_view_markup(pair_id, show_mirror=False):
     markup = InlineKeyboardMarkup(row_width=2)
     
     mon_btn = "🛑 Stop Monitor" if is_mon else "👁️ Monitor"
-    live_btn = "🛑 Stop Live" if is_live else "⚡ Live Forward"
-    mir_btn = "🛑 Stop Mirror" if is_mir else "🔀 Mirror Mode"
     
     markup.add(
-        InlineKeyboardButton(mon_btn, callback_data=f"pair_toggle_mon_{pair_id}"),
-        InlineKeyboardButton(live_btn, callback_data=f"pair_toggle_live_{pair_id}")
+        InlineKeyboardButton(mon_btn, callback_data=f"pair_toggle_mon_{pair_id}")
     )
-    
-    # Mirror mode button ONLY appears if both chats are topic-enabled (forums)
-    if show_mirror:
-        markup.add(InlineKeyboardButton(mir_btn, callback_data=f"pair_toggle_mir_{pair_id}"))
     
     # Content Filter Button
     cf = pair[10] or "everything"
@@ -1052,7 +1045,6 @@ def pair_view_markup(pair_id, show_mirror=False):
     markup.add(InlineKeyboardButton("🗑 Delete Pair", callback_data=f"pair_delete_confirm_{pair_id}"))
     markup.add(InlineKeyboardButton("🔙 Back to Pairs", callback_data="pairs_main"))
     return markup
-
 def user_account_markup():
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -1510,6 +1502,11 @@ async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_t
 
 
 def setup_automation_handlers(client: TelegramClient):
+    if getattr(client, '_automation_handlers_registered', False):
+        logger.info("Automation handlers already registered on this client. Skipping.")
+        return
+    client._automation_handlers_registered = True
+
     @client.on(events.NewMessage)
     async def auto_handler(event):
         m = event.message
@@ -1524,7 +1521,9 @@ def setup_automation_handlers(client: TelegramClient):
 
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
-            
+            if not is_mon:
+                continue
+
             # Normalize ID matching
             source_id_str = str(sid).replace("-100", "")
             msg_id_str = str(m.chat_id).replace("-100", "")
@@ -1542,59 +1541,76 @@ def setup_automation_handlers(client: TelegramClient):
                     msg_topic_anchor = m.reply_to_msg_id
 
                 # --- CONTENT FILTERING ---
-                cf = cf or "everything"
-                if cf == "media" and not m.media:
+                cf_val = cf or "everything"
+                if cf_val == "media" and not m.media:
                     continue
-                if cf == "text" and m.media:
+                if cf_val == "text" and m.media:
                     continue
 
                 # Specific topic filtering
-                if s_topic and str(s_topic) not in [None, 0, "0", "None"]:
-                    if str(msg_topic_anchor) != str(s_topic):
+                topic_filter_id = None
+                if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
+                    try:
+                        topic_filter_id = int(s_topic)
+                    except:
+                        pass
+                
+                if topic_filter_id is not None:
+                    if str(msg_topic_anchor) != str(topic_filter_id):
                         continue
 
-                # --- LOGGING & COLLECTION LOGIC (is_mon) ---
-                if is_mon and m.media:
-                    m_type = type(m.media).__name__
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        if USING_POSTGRES:
-                            c.execute(
-                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                                (pid, sid, m.id, m_type, m.message or "")
-                            )
-                        else:
-                            c.execute(
-                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                                (pid, sid, m.id, m_type, m.message or "")
-                            )
+                # --- LOGGING & COLLECTION LOGIC ---
+                # Save to database (normally)
+                m_type = type(m.media).__name__ if m.media else "text"
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    if USING_POSTGRES:
+                        c.execute(
+                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (pid, sid, m.id, m_type, m.message or "")
+                        )
+                    else:
+                        c.execute(
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                            (pid, sid, m.id, m_type, m.message or "")
+                        )
+
+                # Determine if BOTH chats are forums to automatically mirror topics
+                auto_mirror = False
+                try:
+                    real_sid = sid if str(sid).startswith("-100") else int(f"-100{str(sid).replace('-100', '')}")
+                    real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
+                    src_ent = await client.get_entity(real_sid)
+                    tgt_ent = await client.get_entity(real_tid)
+                    if getattr(src_ent, 'forum', False) and getattr(tgt_ent, 'forum', False):
+                        auto_mirror = True
+                except:
+                    pass
 
                 # --- ALBUM / SINGLE MESSAGE LOGIC ---
                 if m.grouped_id:
                     if m.grouped_id not in album_cache:
                         album_cache[m.grouped_id] = [m]
                         # Wait for all parts
-                        async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic, is_monitoring, live_forward):
+                        async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic, s_chat_id):
                             await asyncio.sleep(5.0) 
                             messages = album_cache.pop(gid, [])
                             if messages:
-                                if live_forward:
-                                    await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
-                                if is_monitoring:
-                                    # Send the entire album to log bots (Vaulting)
-                                    asyncio.create_task(forward_to_log_bots(client, messages, s_id))
-                        asyncio.create_task(delayed_send(m.grouped_id, tid, is_mir, sid, t_topic, is_mon, is_live))
+                                # Mirror/forward normally to target group
+                                await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
+                                # Send the entire album to log bots (Vaulting)
+                                asyncio.create_task(forward_to_log_bots(client, messages, s_chat_id))
+                        asyncio.create_task(delayed_send(m.grouped_id, tid, auto_mirror, sid, t_topic, sid))
                     else:
                         album_cache[m.grouped_id].append(m)
                 else:
-                    if is_live:
-                        await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
-                    if is_mon:
-                        asyncio.create_task(forward_to_log_bots(client, [m], sid))
+                    # Mirror/forward normally to target group
+                    await send_mirrored_content(client, tid, [m], t_topic, auto_mirror, sid)
+                    # Forward to log bots (Vaulting)
+                    asyncio.create_task(forward_to_log_bots(client, [m], sid))
                 
                 # CRITICAL: Break the pair loop once the message is handled to prevent duplication
                 break
-
 # -----------------------------
 # Bot Handlers
 # -----------------------------
@@ -2493,7 +2509,7 @@ def handle_state_inputs(message):
     elif state.startswith("hist_setup_date_end_"):
         pid = int(state.split("_")[-1])
         try:
-            end_dt = datetime.strptime(text, "%d/%m/%Y").replace(tzinfo=timezone.utc)
+            end_dt = datetime.strptime(text, "%d/%m/%Y").replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc)
             start_dt = login_data[uid]["start_date"]
             admin_states.pop(uid)
             login_data.pop(uid, None)
@@ -2529,7 +2545,12 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         sid_resolved = target_chat.id
         
         # Telethon uses iter_messages for history (newest to oldest)
-        target_topic = int(s_topic) if s_topic and str(s_topic) != "0" else None
+        target_topic = None
+        if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
+            try:
+                target_topic = int(s_topic)
+            except:
+                pass
         
         # Collect matching messages first
         collected_messages = []
@@ -2658,14 +2679,33 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         running_tasks.pop(task_key, None)
 
 async def resolve_target_id(client: TelegramClient, target_ref):
+    # Try resolving target_ref directly
     try:
         return await client.get_entity(target_ref)
     except Exception as e:
-        logger.error(f"Entity Resolve Error: {e}")
-        # Try finding via dialogs if ref is just an ID
+        logger.warning(f"Initial get_entity failed for {target_ref}: {e}")
+        
+    # If target_ref is numeric, try with -100 prefix or other variations
+    ref_str = str(target_ref).strip()
+    if ref_str.replace("-", "").isdigit():
+        # Try numeric prefixes
+        clean_id = ref_str.replace("-100", "").replace("-", "")
+        for candidate in [int(f"-100{clean_id}"), -int(clean_id), int(clean_id)]:
+            try:
+                return await client.get_entity(candidate)
+            except:
+                pass
+
+    # Try finding via dialogs
+    try:
+        clean_ref = ref_str.replace("-100", "").replace("-", "")
         async for dialog in client.iter_dialogs(limit=200):
-            if str(dialog.id) == str(target_ref):
+            d_id_str = str(dialog.id).replace("-100", "").replace("-", "")
+            if d_id_str == clean_ref:
                 return dialog.entity
+    except Exception as e:
+        logger.error(f"iter_dialogs failed during resolution: {e}")
+
     raise ValueError(f"Could not find or access chat: {target_ref}")
 
 async def run_collection(admin_chat_id, pair_id, limit=300):
@@ -2679,53 +2719,150 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     
     row = get_target_pair(pair_id)
     if not row: return
-    pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic = row
+    # Unpack 11 fields including cf (content_filter)
+    pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf = row
     collected = 0
     scanned = 0
+    sent_count = 0
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}"))
-    status_msg = bot.send_message(admin_chat_id, f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `0`\n📥 New items: `0`", reply_markup=markup, parse_mode="Markdown")
+    status_msg = bot.send_message(admin_chat_id, f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `0`\n📥 Collected: `0`\n📤 Sent: `0`", reply_markup=markup, parse_mode="Markdown")
     
     try:
         # Force peer resolution (Anti PeerIdInvalid)
         target_chat = await resolve_target_id(userbot, sid)
         sid_resolved = target_chat.id
         
-        # Telethon iter_messages is powerful and supports reply_to (topic) filtering natively
-        # Use int(s_topic) if it's a valid thread ID, otherwise None for entire chat
-        target_topic = int(s_topic) if s_topic and str(s_topic) != "0" else None
+        # Telethon uses iter_messages for history (newest to oldest)
+        target_topic = None
+        if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
+            try:
+                target_topic = int(s_topic)
+            except:
+                pass
+        
+        collected_messages = []
+        
         async for m in userbot.iter_messages(sid_resolved, limit=limit, reply_to=target_topic):
             if not running_tasks.get(task_key):
-                bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.")
                 break
             
             scanned += 1
             
-            # --- BAN LIST CHECK ---
+            # Ban list check
             sender_id = m.sender_id
             sender_username = getattr(m.sender, 'username', None)
             if is_user_banned(sender_id, sender_username):
                 continue
 
-            if m.media:
-                m_type = type(m.media).__name__
+            # Content type filter
+            cf_val = cf or "everything"
+            if cf_val == "media" and not m.media:
+                continue
+            if cf_val == "text" and m.media:
+                continue
+
+            collected_messages.append(m)
+            collected += 1
+            
+            if scanned % 50 == 0:
+                l_text = f" / {limit}" if limit else ""
+                try:
+                    bot.edit_message_text(
+                        f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: `{sent_count}`",
+                        admin_chat_id,
+                        status_msg.message_id,
+                        reply_markup=markup,
+                        parse_mode="Markdown"
+                    )
+                except:
+                    pass
+            await asyncio.sleep(0.02)
+
+        if not running_tasks.get(task_key):
+            bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.")
+            return
+
+        # Now reverse to get chronological order (oldest to newest)
+        collected_messages.reverse()
+        
+        # Group consecutive messages with the same grouped_id (Albums)
+        grouped_batches = []
+        temp_group = []
+        for m in collected_messages:
+            if m.grouped_id:
+                if not temp_group:
+                    temp_group.append(m)
+                elif temp_group[0].grouped_id == m.grouped_id:
+                    temp_group.append(m)
+                else:
+                    grouped_batches.append(temp_group)
+                    temp_group = [m]
+            else:
+                if temp_group:
+                    grouped_batches.append(temp_group)
+                    temp_group = []
+                grouped_batches.append([m])
+        if temp_group:
+            grouped_batches.append(temp_group)
+
+        # Determine if BOTH chats are forums to automatically mirror topics
+        auto_mirror = False
+        try:
+            real_sid = sid if str(sid).startswith("-100") else int(f"-100{str(sid).replace('-100', '')}")
+            real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
+            src_ent = await userbot.get_entity(real_sid)
+            tgt_ent = await userbot.get_entity(real_tid)
+            if getattr(src_ent, 'forum', False) and getattr(tgt_ent, 'forum', False):
+                auto_mirror = True
+        except:
+            pass
+
+        # Save and forward both normally and through vault
+        for batch in grouped_batches:
+            if not running_tasks.get(task_key):
+                bot.send_message(admin_chat_id, f"🛑 Collection forwarding stopped by user.")
+                break
+                
+            # 1. Forward directly to target group (Normally)
+            await send_mirrored_content(userbot, tid, batch, t_topic, auto_mirror, sid_resolved)
+            sent_count += len(batch)
+            
+            # 2. Vaulting / Save to database
+            for m in batch:
+                m_type = type(m.media).__name__ if m.media else "text"
                 with db_conn() as conn:
                     c = conn.cursor()
                     if USING_POSTGRES:
-                        c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid_resolved, m.id, m_type, m.message or ""))
+                        c.execute(
+                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (pair_id, sid_resolved, m.id, m_type, m.message or "")
+                        )
                     else:
-                        c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid_resolved, m.id, m_type, m.message or ""))
-                    if c.rowcount > 0: 
-                        collected += 1
-                        # Instantly send to log targets
-                        await forward_to_log_bots(userbot, [m], sid_resolved)
+                        c.execute(
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                            (pair_id, sid_resolved, m.id, m_type, m.message or "")
+                        )
             
-            if scanned % 20 == 0:
-                try: bot.edit_message_text(f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
-                except: pass
-            await asyncio.sleep(0.5)
+            # 3. Send to log bots (through Vault)
+            asyncio.create_task(forward_to_log_bots(userbot, batch, sid_resolved))
+                
+            # Edit status message
+            l_text = f" / {limit}" if limit else ""
+            try:
+                bot.edit_message_text(
+                    f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: `{sent_count}`",
+                    admin_chat_id,
+                    status_msg.message_id,
+                    reply_markup=markup,
+                    parse_mode="Markdown"
+                )
+            except:
+                pass
+                
+            await asyncio.sleep(0.5) # Flood wait safety buffer
 
-        bot.send_message(admin_chat_id, f"✅ Collection Done: `{s_title}`\nNew items: `{collected}`")
+        bot.send_message(admin_chat_id, f"✅ Collection Done: `{s_title}`\nScanned: `{scanned}`\nCollected & Saved: `{collected}`\nSent to Target: `{sent_count}`")
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
     finally:

@@ -1029,9 +1029,8 @@ def pair_view_markup(pair_id, show_mirror=False):
         InlineKeyboardButton(live_btn, callback_data=f"pair_toggle_live_{pair_id}")
     )
     
-    # Mirror mode button ONLY appears if both chats are topic-enabled (forums)
-    if show_mirror:
-        markup.add(InlineKeyboardButton(mir_btn, callback_data=f"pair_toggle_mir_{pair_id}"))
+    # Unconditionally show Mirror Mode button so the admin can always toggle it!
+    markup.add(InlineKeyboardButton(mir_btn, callback_data=f"pair_toggle_mir_{pair_id}"))
     
     # Content Filter Button
     cf = pair[10] or "everything"
@@ -1055,53 +1054,12 @@ def pair_view_markup(pair_id, show_mirror=False):
     else: markup.add(InlineKeyboardButton("📥 Collect Now", callback_data=f"pair_collect_{pair_id}"))
     
     # Single Release Button showing total unreleased count
-    if is_rel: markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_monitor_{pair_id}")) # Fallback stop
+    if is_rel: markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_monitor_{pair_id}"))
     else: markup.add(InlineKeyboardButton(f"🚀 Release Now ({total_pending})", callback_data=f"pair_release_{pair_id}"))
 
     markup.add(InlineKeyboardButton("🗑 Delete Pair", callback_data=f"pair_delete_confirm_{pair_id}"))
     markup.add(InlineKeyboardButton("🔙 Back to Pairs", callback_data="pairs_main"))
     return markup
-    for dialog in page_items:
-        chat = dialog.entity
-        is_forum = getattr(chat, "forum", False)
-        
-        # Better visual distinction
-        if isinstance(chat, types.Channel):
-            if is_forum:
-                icon = "🏛️"
-                title = f"『 TOPIC 』 {chat.title}"
-            elif chat.broadcast:
-                icon = "📢"
-                title = chat.title or "Channel"
-            else:
-                icon = "👥"
-                title = chat.title or "Group"
-        elif isinstance(chat, types.Chat):
-            icon = "👥"
-            title = chat.title or "Group"
-        elif isinstance(chat, types.User):
-            if chat.bot: icon = "🤖"
-            else: icon = "👤"
-            title = f"{chat.first_name or ''} {chat.last_name or ''}".strip() or "Private Chat"
-        else:
-            icon = "💬"
-            title = "Unknown"
-
-        markup.add(
-            InlineKeyboardButton(
-                f"{icon} {title}",
-                callback_data=f"{prefix}_{chat.id}"
-            )
-        )
-    
-    nav = []
-    if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"{prefix}_page_{page-1}"))
-    if end < len(chats): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"{prefix}_page_{page+1}"))
-    if nav: markup.add(*nav)
-    
-    markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="pairs_main"))
-    return markup
-
 async def get_topic_selection_markup(chat_id, prefix):
     markup = InlineKeyboardMarkup(row_width=1)
     if not userbot or not userbot.is_connected():

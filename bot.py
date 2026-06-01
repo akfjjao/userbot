@@ -806,7 +806,7 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
 
             await asyncio.sleep(interval)
             
-        sender_bot.send_message(admin_chat_id, f"✅ *Transfer Complete!*\nTotal: `{total}`\nSuccessful: `{success}`")
+        sender_bot.send_message(admin_chat_id, f"✅ **Vault Release Completed**\n\n📦 **Total Released:** `{total}` items\n\n🎉 **Successful:** `{success}`\n❌ **Failed:** `{total - success}`", parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Global Release Error: {e}")
         sender_bot.send_message(admin_chat_id, f"❌ Engine Error: {e}")
@@ -2603,21 +2603,24 @@ def handle_state_inputs(message):
         source_type = parts[4]
         pid = int(parts[5])
         if not text.isdigit():
-            bot.reply_to(message, "Please send a number.")
+            bot.reply_to(message, "Please send a valid number.")
             return
         interval = int(text)
-        admin_states.pop(uid)
-        m_names = {"monitor": "Monitor", "scraper": "History Scraper", "collection": "Collect Now"}
+        admin_states.pop(uid, None)
+        
+        m_names = {"monitor": "Monitoring", "scraper": "History Scraper", "collection": "Collect Now"}
         display_name = m_names.get(source_type, "Vault Items")
-        bot.send_message(message.chat.id, f"🚀 *Slow Release Started*\nPair: `{pid}` | Source: `{display_name}` | Interval: `{interval}s`")
+        
+        bot.send_message(
+            message.chat.id, 
+            f"⏳ **Slow Release Initiated**\n\n"
+            f"🎯 **Target Pair ID:** `{pid}`\n"
+            f"📥 **Collection Source:** `{display_name}`\n"
+            f"⏰ **Release Interval:** `{interval}s` between items\n\n"
+            f"🚀 *Engine running in background...*",
+            parse_mode="Markdown"
+        )
         asyncio.run_coroutine_threadsafe(run_release(message.chat.id, pid, added_by=source_type, interval=interval), loop)
-        admin_states.pop(uid)
-        m_names = {"photo": "Photos", "video": "Videos", "file": "Files"}
-        display_name = m_names.get(media_type, "Media")
-        bot.send_message(message.chat.id, f"🚀 *Slow Release Started*\nPair: `{pid}` | Category: `{display_name}` | Interval: `{interval}s`")
-        asyncio.run_coroutine_threadsafe(run_release(message.chat.id, pid, media_type=media_type, interval=interval), loop)
-        asyncio.run_coroutine_threadsafe(run_release(message.chat.id, pid, interval=interval), loop)
-
     elif state.startswith("hist_setup_count_only_"):
         pid = int(state.split("_")[-1])
         if not text.isdigit():

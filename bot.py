@@ -1150,7 +1150,7 @@ async def get_topic_selection_markup(chat_id, prefix):
         # Force entity resolution first to avoid ChannelInvalidError / PeerIdInvalidError
         entity = await resolve_target_id(userbot, chat_id)
         result = await userbot(functions.messages.GetForumTopicsRequest(
-            channel=entity,
+            peer=entity,
             offset_date=0,
             offset_id=0,
             offset_topic=0,
@@ -1217,7 +1217,7 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
         # Force entity resolution first to avoid ChannelInvalidError / PeerIdInvalidError
         target_chat = await resolve_target_id(client, t_chat_id)
         result = await client(functions.messages.GetForumTopicsRequest(
-            channel=target_chat,
+            peer=target_chat,
             offset_date=0,
             offset_id=0,
             offset_topic=0,
@@ -1239,14 +1239,14 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
         # 4) Create if not found
         logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id} (Icon: {icon_emoji_id})")
         created = await client(functions.messages.CreateForumTopicRequest(
-            channel=target_chat,
+            peer=target_chat,
             title=topic_title,
             icon_emoji_id=int(icon_emoji_id) if icon_emoji_id else None
         ))
         
         await asyncio.sleep(1)
         res_after = await client(functions.messages.GetForumTopicsRequest(
-            channel=target_chat,
+            peer=target_chat,
             offset_date=0, offset_id=0, offset_topic=0, limit=20
         ))
         for t in res_after.topics:
@@ -1385,6 +1385,130 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
     except Exception as e:
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
 
+async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid):
+    """Unified Hub for mirrored sending with native Forum Topic support."""
+    try:
+        if not messages: return
+        first_msg = messages[0]
+        dest_topic_id = default_t_topic
+        
+        # 1. Resolve Topic Mapping
+        if is_mir:
+            source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+            if source_top:
+                forum = getattr(first_msg.reply_to, "forum_topic", None)
+                src_title = getattr(forum, "title", None)
+                src_icon = None
+                if not src_title:
+                    try:
+                        resolved_sid = await resolve_target_id(client, sid)
+                        res = await client(functions.messages.GetForumTopicsRequest(
+                            peer=resolved_sid,
+                            offset_date=0,
+                            offset_id=0,
+                            offset_topic=0,
+                            limit=100
+                        ))
+                        for t in res.topics:
+                            if t.id == source_top:
+                                src_title = t.title
+                                src_icon = getattr(t, "icon_emoji_id", None)
+                                break
+                    except: pass
+                
+                if src_title:
+                    logger.info(f"MIRROR: Resolved source topic title: '{src_title}' (Icon: {src_icon})")
+                    dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
+                else:
+                    logger.warning(f"MIRROR: Could not resolve title for source topic {source_top}")
+
+        # 2. Check if Target is a Forum
+        is_forum = False
+        try:
+            # Ensure we have the -100 prefix for entity lookup
+            real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
+            try:
+                tgt_ent = await client.get_entity(real_tid)
+                is_forum = getattr(tgt_ent, 'forum', False)
+            except:
+                tgt_ent = await client.get_entity(tid)
+                is_forum = getattr(tgt_ent, 'forum', False)
+        except: pass
+
+        # 3. Resolve Reply Header
+        reply_header = None
+        if is_forum:
+            reply_header = int(dest_topic_id) if dest_topic_id else None
+            # If replying to a specific message inside the topic, use mapped ID
+            if first_msg.reply_to_msg_id:
+                mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
+                if mapped: reply_header = int(mapped)
+        else:
+            # Normal Group: Use Message Mapping for Replies
+            if first_msg.reply_to_msg_id:
+                mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
+                if mapped: reply_header = int(mapped)
+
+        # 4. Send Content
+        album_text = next((msg.message for msg in messages if msg.message), "")
+        sent = None
+        
+        for attempt in range(3):
+            try:
+                sent = await client.send_message(
+                    entity=int(tid), 
+                    message=album_text, 
+                    file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
+                    reply_to=reply_header
+                )
+                if sent:
+                    first_id = sent[0].id if isinstance(sent, list) else sent.id
+                    logger.info(f"✅ MIRROR: Sent to {tid} -> MSG ID: {first_id}")
+                    save_message_mapping(sid, first_msg.id, tid, first_id)
+                    break # Success!
+            except errors.FloodWaitError as fwe:
+                logger.warning(f"⏳ MIRROR FLOOD: Waiting {fwe.seconds}s...")
+                await asyncio.sleep(fwe.seconds)
+            except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
+                await asyncio.sleep(2)
+            except Exception as e:
+                err_msg = str(e).lower()
+                if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference"]):
+                    logger.info("🛡️ MIRROR: Protected chat detected. Using fallback...")
+                    sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
+                    if sent: break # Success via fallback
+                else:
+                    logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
+                    if attempt == 2: # Last attempt
+                        logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
+        
+    except Exception as e:
+        logger.error(f"Global Mirror Error: {e}")
+
+async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header):
+    """Downloads and re-uploads protected content."""
+    import os
+    downloaded = []
+    try:
+        for m in messages:
+            if m.media:
+                path = await client.download_media(m.media)
+                if path: downloaded.append(path)
+        if downloaded:
+            sent = await client.send_message(
+                entity=int(tid), message=album_text, 
+                file=downloaded if len(downloaded) > 1 else downloaded[0],
+                reply_to=reply_header
+            )
+            if sent:
+                first_id = sent[0].id if isinstance(sent, list) else sent.id
+                save_message_mapping(sid, first_msg.id, tid, first_id)
+    finally:
+        for p in downloaded:
+            if os.path.exists(p): os.remove(p)
+
+
+
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
     async def auto_handler(event):
@@ -1470,121 +1594,6 @@ def setup_automation_handlers(client: TelegramClient):
                 
                 # CRITICAL: Break the pair loop once the message is handled to prevent duplication
                 break
-
-    async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid):
-        """Unified Hub for mirrored sending with native Forum Topic support."""
-        try:
-            if not messages: return
-            first_msg = messages[0]
-            dest_topic_id = default_t_topic
-            
-            # 1. Resolve Topic Mapping
-            if is_mir:
-                source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
-                if source_top:
-                    forum = getattr(first_msg.reply_to, "forum_topic", None)
-                    src_title = getattr(forum, "title", None)
-                    src_icon = None
-                    if not src_title:
-                        try:
-                            res = await client(functions.messages.GetForumTopicsRequest(channel=int(sid), offset_date=0, offset_id=0, offset_topic=0, limit=100))
-                            for t in res.topics:
-                                if t.id == source_top:
-                                    src_title = t.title
-                                    src_icon = getattr(t, "icon_emoji_id", None)
-                                    break
-                        except: pass
-                    
-                    if src_title:
-                        logger.info(f"MIRROR: Resolved source topic title: '{src_title}' (Icon: {src_icon})")
-                        dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
-                    else:
-                        logger.warning(f"MIRROR: Could not resolve title for source topic {source_top}")
-
-            # 2. Check if Target is a Forum
-            is_forum = False
-            try:
-                # Ensure we have the -100 prefix for entity lookup
-                real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
-                try:
-                    tgt_ent = await client.get_entity(real_tid)
-                    is_forum = getattr(tgt_ent, 'forum', False)
-                except:
-                    tgt_ent = await client.get_entity(tid)
-                    is_forum = getattr(tgt_ent, 'forum', False)
-            except: pass
-
-            # 3. Resolve Reply Header
-            reply_header = None
-            if is_forum:
-                reply_header = int(dest_topic_id) if dest_topic_id else None
-                # If replying to a specific message inside the topic, use mapped ID
-                if first_msg.reply_to_msg_id:
-                    mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                    if mapped: reply_header = int(mapped)
-            else:
-                # Normal Group: Use Message Mapping for Replies
-                if first_msg.reply_to_msg_id:
-                    mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                    if mapped: reply_header = int(mapped)
-
-            # 4. Send Content
-            album_text = next((msg.message for msg in messages if msg.message), "")
-            sent = None
-            
-            for attempt in range(3):
-                try:
-                    sent = await client.send_message(
-                        entity=int(tid), 
-                        message=album_text, 
-                        file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
-                        reply_to=reply_header
-                    )
-                    if sent:
-                        first_id = sent[0].id if isinstance(sent, list) else sent.id
-                        logger.info(f"✅ MIRROR: Sent to {tid} -> MSG ID: {first_id}")
-                        save_message_mapping(sid, first_msg.id, tid, first_id)
-                        break # Success!
-                except errors.FloodWaitError as fwe:
-                    logger.warning(f"⏳ MIRROR FLOOD: Waiting {fwe.seconds}s...")
-                    await asyncio.sleep(fwe.seconds)
-                except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
-                    await asyncio.sleep(2)
-                except Exception as e:
-                    err_msg = str(e).lower()
-                    if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference"]):
-                        logger.info("🛡️ MIRROR: Protected chat detected. Using fallback...")
-                        sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
-                        if sent: break # Success via fallback
-                    else:
-                        logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
-                        if attempt == 2: # Last attempt
-                            logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
-            
-        except Exception as e:
-            logger.error(f"Global Mirror Error: {e}")
-
-    async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header):
-        """Downloads and re-uploads protected content."""
-        import os
-        downloaded = []
-        try:
-            for m in messages:
-                if m.media:
-                    path = await client.download_media(m.media)
-                    if path: downloaded.append(path)
-            if downloaded:
-                sent = await client.send_message(
-                    entity=int(tid), message=album_text, 
-                    file=downloaded if len(downloaded) > 1 else downloaded[0],
-                    reply_to=reply_header
-                )
-                if sent:
-                    first_id = sent[0].id if isinstance(sent, list) else sent.id
-                    save_message_mapping(sid, first_msg.id, tid, first_id)
-        finally:
-            for p in downloaded:
-                if os.path.exists(p): os.remove(p)
 
 # -----------------------------
 # Bot Handlers
@@ -2504,65 +2513,145 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
     
     pair = get_target_pair(pair_id)
     if not pair: return
-    pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic = pair
+    # Unpack 11 fields including cf (content_filter)
+    pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf = pair
     
     collected = 0
     scanned = 0
+    sent_count = 0
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🛑 Stop Scrape", callback_data=f"pair_stop_task_hist_{pair_id}"))
-    status_msg = bot.send_message(admin_chat_id, f"📜 *History Scrape: `{s_title}`*\n\n🔍 Scanned: `0`\n📥 Collected: `0`", reply_markup=markup, parse_mode="Markdown")
+    status_msg = bot.send_message(admin_chat_id, f"📜 *History Scrape: `{s_title}`*\n\n🔍 Scanned: `0`\n📥 Collected: `0`\n📤 Sent: `0`", reply_markup=markup, parse_mode="Markdown")
     
     try:
         # Force peer resolution (Anti PeerIdInvalid)
         target_chat = await resolve_target_id(userbot, sid)
         sid_resolved = target_chat.id
         
-        # Telethon uses iter_messages for history
+        # Telethon uses iter_messages for history (newest to oldest)
         target_topic = int(s_topic) if s_topic and str(s_topic) != "0" else None
+        
+        # Collect matching messages first
+        collected_messages = []
+        
         async for m in userbot.iter_messages(sid_resolved, reply_to=target_topic):
             if not running_tasks.get(task_key):
-                bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
                 break
             
             scanned += 1
-            # Date filter
-            if end_date and m.date > end_date: continue
-            if start_date and m.date < start_date: break # History is newest to oldest
+            
+            # Date filters (History goes newest to oldest)
+            if end_date and m.date > end_date:
+                continue
+            if start_date and m.date < start_date:
+                break # Since we go newest to oldest, anything before start_date means we are done
 
-            # --- BAN LIST CHECK ---
+            # Ban list check
             sender_id = m.sender_id
             sender_username = getattr(m.sender, 'username', None)
             if is_user_banned(sender_id, sender_username):
                 continue
 
-            if m.media:
-                m_type = type(m.media).__name__
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    if USING_POSTGRES:
-                        c.execute(
-                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pair_id, sid_resolved, m.id, m_type, m.message or "")
-                        )
-                    else:
-                        c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                            (pair_id, sid_resolved, m.id, m_type, m.message or "")
-                        )
-                    if c.rowcount > 0: 
-                        collected += 1
-                        # Instantly send to log targets
-                        await forward_to_log_bots(userbot, [m], sid_resolved)
+            # Content type filter
+            cf_val = cf or "everything"
+            if cf_val == "media" and not m.media:
+                continue
+            if cf_val == "text" and m.media:
+                continue
+
+            collected_messages.append(m)
+            collected += 1
             
-            if limit and collected >= limit: break
-            
+            if limit and collected >= limit:
+                break
+                
             if scanned % 50 == 0:
                 l_text = f" / {limit}" if limit else ""
-                try: bot.edit_message_text(f"📜 *History Scrape: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
-                except: pass
-            await asyncio.sleep(0.1)
+                try:
+                    bot.edit_message_text(
+                        f"📜 *History Scrape: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: `{sent_count}`",
+                        admin_chat_id,
+                        status_msg.message_id,
+                        reply_markup=markup,
+                        parse_mode="Markdown"
+                    )
+                except:
+                    pass
+            await asyncio.sleep(0.02)
+            
+        if not running_tasks.get(task_key):
+            bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
+            return
+
+        # Now reverse to get chronological order (oldest to newest)
+        collected_messages.reverse()
         
-        bot.send_message(admin_chat_id, f"✅ History Scrape Done: `{s_title}`\nCollected: `{collected}`")
+        # Group consecutive messages with the same grouped_id (Albums)
+        grouped_batches = []
+        temp_group = []
+        for m in collected_messages:
+            if m.grouped_id:
+                if not temp_group:
+                    temp_group.append(m)
+                elif temp_group[0].grouped_id == m.grouped_id:
+                    temp_group.append(m)
+                else:
+                    grouped_batches.append(temp_group)
+                    temp_group = [m]
+            else:
+                if temp_group:
+                    grouped_batches.append(temp_group)
+                    temp_group = []
+                grouped_batches.append([m])
+        if temp_group:
+            grouped_batches.append(temp_group)
+
+        # Forward the batches chronologically to the target group and vault them if needed
+        for batch in grouped_batches:
+            if not running_tasks.get(task_key):
+                bot.send_message(admin_chat_id, f"🛑 History scrape forwarding stopped by user.")
+                break
+                
+            # Forward directly to target group
+            await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved)
+            sent_count += len(batch)
+            
+            # Vaulting / Log bots logic if enabled
+            if is_mon:
+                for m in batch:
+                    if m.media:
+                        m_type = type(m.media).__name__
+                        with db_conn() as conn:
+                            c = conn.cursor()
+                            if USING_POSTGRES:
+                                c.execute(
+                                    "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                                    (pair_id, sid_resolved, m.id, m_type, m.message or "")
+                                )
+                            else:
+                                c.execute(
+                                    "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                                    (pair_id, sid_resolved, m.id, m_type, m.message or "")
+                                )
+                # Send the entire batch to log bots (vaulting)
+                asyncio.create_task(forward_to_log_bots(userbot, batch, sid_resolved))
+                
+            # Edit status message
+            l_text = f" / {limit}" if limit else ""
+            try:
+                bot.edit_message_text(
+                    f"📜 *History Scrape: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: `{sent_count}`",
+                    admin_chat_id,
+                    status_msg.message_id,
+                    reply_markup=markup,
+                    parse_mode="Markdown"
+                )
+            except:
+                pass
+                
+            await asyncio.sleep(0.5) # Flood wait safety buffer
+
+        bot.send_message(admin_chat_id, f"✅ History Scrape Done: `{s_title}`\nScanned: `{scanned}`\nCollected: `{collected}`\nSent to Target: `{sent_count}`")
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Scrape Error: {e}")
     finally:

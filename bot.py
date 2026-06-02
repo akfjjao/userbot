@@ -2114,6 +2114,82 @@ def cmd_logout(message):
     markup.add(InlineKeyboardButton("❌ Cancel", callback_data="dash_main"))
     bot.send_message(message.chat.id, "⚠️ *Logout Confirmation*\n\nThis will stop the userbot and delete the session from the database. Are you sure?", reply_markup=markup, parse_mode="Markdown")
 
+def parse_telegram_link(text):
+    text = text.strip()
+    # Private Invite links
+    m = re.search(r'(?:t\.me|telegram\.me)/joinchat/([a-zA-Z0-9_\-]+)', text)
+    if m: return {"type": "invite", "hash": m.group(1)}
+    m = re.search(r'(?:t\.me|telegram\.me)/\+([a-zA-Z0-9_\-]+)', text)
+    if m: return {"type": "invite", "hash": m.group(1)}
+    # Public Usernames
+    m = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,})', text)
+    if m: return {"type": "username", "username": m.group(1)}
+    m = re.search(r'^@([a-zA-Z0-9_]{5,})$', text)
+    if m: return {"type": "username", "username": m.group(1)}
+    return None
+
+async def join_chat_task(call, link_type, value):
+    try:
+        is_ok, msg = await ensure_userbot()
+        if not is_ok:
+            bot.edit_message_text(f"❌ Userbot connection failed: {msg}", call.message.chat.id, call.message.message_id)
+            return
+        
+        bot.edit_message_text("⏳ *Userbot joining chat...*", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+        
+        chat_entity = None
+        if link_type == "invite":
+            from telethon.tl.functions.messages import ImportChatInviteRequest
+            try:
+                result = await userbot(ImportChatInviteRequest(value))
+                if hasattr(result, "chats") and result.chats:
+                    chat_entity = result.chats[0]
+            except errors.UserAlreadyParticipantError:
+                from telethon.tl.functions.messages import CheckChatInviteRequest
+                invite_info = await userbot(CheckChatInviteRequest(value))
+                if hasattr(invite_info, "chat"):
+                    chat_entity = invite_info.chat
+            except Exception as e:
+                bot.edit_message_text(f"❌ *Failed to join invite link:*\n`{e}`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+                return
+        else:
+            from telethon.tl.functions.channels import JoinChannelRequest
+            try:
+                chat_entity = await userbot.get_entity(value)
+                await userbot(JoinChannelRequest(chat_entity))
+            except Exception as e:
+                bot.edit_message_text(f"❌ *Failed to join username:*\n`{e}`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+                return
+                
+        if not chat_entity:
+            bot.edit_message_text("❌ Could not resolve chat details after joining.", call.message.chat.id, call.message.message_id)
+            return
+            
+        from telethon.utils import get_peer_id
+        peer_id = get_peer_id(chat_entity)
+        chat_title = getattr(chat_entity, "title", "Joined Chat")
+        
+        login_data[call.from_user.id] = {
+            "joined_chat_id": peer_id,
+            "joined_chat_title": chat_title
+        }
+        
+        text = (f"✅ *Successfully Joined!*\n\n"
+                f"Group: `{chat_title}`\n"
+                f"ID: `{peer_id}`\n\n"
+                f"What would you like to set this group as?")
+                
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("👁️ Set as Source", callback_data=f"join_set_source|{peer_id}"),
+            InlineKeyboardButton("🎯 Set as Target", callback_data=f"join_set_target|{peer_id}"),
+            InlineKeyboardButton("❌ Nothing (Just Join)", callback_data="join_set_nothing")
+        )
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Join Chat Task Error: {e}")
+        bot.edit_message_text(f"❌ Join error: {e}", call.message.chat.id, call.message.message_id)
+
 async def finalize_pair_task(call, uid):
     try:
         data = login_data.get(uid)
@@ -2157,6 +2233,84 @@ def handle_callbacks(call):
         return
 
     data = call.data
+    
+    if data.startswith("join_chat_yes|"):
+        parts = data.split("|")
+        link_type = parts[1]
+        value = parts[2]
+        asyncio.run_coroutine_threadsafe(join_chat_task(call, link_type, value), loop)
+        return
+        
+    elif data == "join_chat_cancel":
+        bot.answer_callback_query(call.id, "Cancelled")
+        bot.edit_message_text("❌ Join request cancelled.", call.message.chat.id, call.message.message_id)
+        return
+        
+    elif data == "join_set_nothing":
+        bot.answer_callback_query(call.id)
+        login_data.pop(uid, None)
+        bot.edit_message_text("✅ Chat joined. No automation pairs were created.", call.message.chat.id, call.message.message_id)
+        return
+
+    elif data.startswith("join_set_source|"):
+        bot.answer_callback_query(call.id)
+        parts = data.split("|")
+        sid = int(parts[1])
+        
+        async def init_source_flow():
+            try:
+                full_chat = await userbot.get_entity(sid)
+                is_forum = getattr(full_chat, "forum", False)
+                if is_forum:
+                    markup = await get_topic_selection_markup(sid, "join_src_topic")
+                    bot.edit_message_text(f"🧵 *『 {getattr(full_chat, 'title', 'Forum')} 』*\nSelect a source topic:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                else:
+                    login_data[uid] = {
+                        "source_id": sid,
+                        "source_topic_id": None,
+                        "preselected_flow": "source"
+                    }
+                    markup = await get_chat_selection_markup("sel_tgt", 0)
+                    bot.edit_message_text("🎯 *Select Target Chat*\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            except Exception as e:
+                bot.send_message(call.message.chat.id, f"❌ Error: {e}")
+        asyncio.run_coroutine_threadsafe(init_source_flow(), loop)
+        return
+
+    elif data.startswith("join_src_topic_"):
+        bot.answer_callback_query(call.id)
+        payload = data.replace("join_src_topic_", "", 1)
+        sid_str, stid_str = payload.rsplit("_", 1)
+        sid = int(sid_str)
+        stid = int(stid_str)
+        if stid == 0: stid = None
+        
+        login_data[uid] = {
+            "source_id": sid,
+            "source_topic_id": stid,
+            "preselected_flow": "source"
+        }
+        async def show_tgt():
+            markup = await get_chat_selection_markup("sel_tgt", 0)
+            bot.edit_message_text("🎯 *Select Target Chat*\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        asyncio.run_coroutine_threadsafe(show_tgt(), loop)
+        return
+
+    elif data.startswith("join_set_target|"):
+        bot.answer_callback_query(call.id)
+        parts = data.split("|")
+        tid = int(parts[1])
+        
+        login_data[uid] = {
+            "target_id": tid,
+            "target_topic_id": None,
+            "preselected_flow": "target"
+        }
+        async def show_src():
+            markup = await get_chat_selection_markup("sel_src", 0)
+            bot.edit_message_text("🎯 *Select Source Chat*\nChoose the group or channel to collect from:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        asyncio.run_coroutine_threadsafe(show_src(), loop)
+        return
     
     if data == "dash_main":
         bot.answer_callback_query(call.id)
@@ -2377,11 +2531,18 @@ def handle_callbacks(call):
         if stid == 0:
             stid = None
             
-        login_data[uid] = {"source_id": sid, "source_topic_id": stid}
-        async def show_tgt():
-            markup = await get_chat_selection_markup("sel_tgt", 0)
-            bot.edit_message_text("🎯 *Select Target Chat*\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-        asyncio.run_coroutine_threadsafe(show_tgt(), loop)
+        if uid not in login_data:
+            login_data[uid] = {}
+        login_data[uid]["source_id"] = sid
+        login_data[uid]["source_topic_id"] = stid
+        
+        if login_data[uid].get("preselected_flow") == "target":
+            asyncio.run_coroutine_threadsafe(finalize_pair_task(call, uid), loop)
+        else:
+            async def show_tgt():
+                markup = await get_chat_selection_markup("sel_tgt", 0)
+                bot.edit_message_text("🎯 *Select Target Chat*\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            asyncio.run_coroutine_threadsafe(show_tgt(), loop)
 
     elif data.startswith("sel_src_"):
         bot.answer_callback_query(call.id)
@@ -2404,9 +2565,16 @@ def handle_callbacks(call):
                         markup = await get_topic_selection_markup(sid, "sel_src_topic")
                         bot.edit_message_text(f"🧵 *『 {getattr(full_chat, 'title', 'Forum')} 』*\nSelect a source topic:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
                     else:
-                        login_data[uid] = {"source_id": sid, "source_topic_id": None}
-                        markup = await get_chat_selection_markup("sel_tgt", 0)
-                        bot.edit_message_text("🎯 *Select Target Chat*\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                        if uid not in login_data:
+                            login_data[uid] = {}
+                        login_data[uid]["source_id"] = sid
+                        login_data[uid]["source_topic_id"] = None
+                        
+                        if login_data[uid].get("preselected_flow") == "target":
+                            await finalize_pair_task(call, uid)
+                        else:
+                            markup = await get_chat_selection_markup("sel_tgt", 0)
+                            bot.edit_message_text("🎯 *Select Target Chat*\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
                 except Exception as e:
                     bot.send_message(call.message.chat.id, f"❌ Error: {e}")
             asyncio.run_coroutine_threadsafe(handle_src(), loop)
@@ -4238,6 +4406,27 @@ async def main():
     else:
         while True:
             await asyncio.sleep(3600)
+
+@bot.message_handler(func=lambda m: m.from_user.id == ADMIN_ID)
+def handle_admin_direct_message(message):
+    text = message.text.strip() if message.text else ""
+    if not text: return
+    
+    parsed = parse_telegram_link(text)
+    if parsed:
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("✅ Yes, Join", callback_data=f"join_chat_yes|{parsed['type']}|{parsed['hash'] if parsed['type'] == 'invite' else parsed['username']}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="join_chat_cancel")
+        )
+        bot.send_message(
+            message.chat.id,
+            f"❓ *Group Join Request*\n\nDetected Telegram reference: `{text}`\nDo you want the Userbot to join this chat?",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+    else:
+        bot.reply_to(message, "❓ *Unrecognized Input*\n\nTo join a group, send its username (e.g. `@groupname`), public link (e.g. `t.me/groupname`), or private invite link (e.g. `t.me/+invitehash`).", parse_mode="Markdown")
 
 if __name__ == "__main__":
     loop.run_until_complete(main())

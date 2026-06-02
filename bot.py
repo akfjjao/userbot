@@ -2214,6 +2214,24 @@ def setup_automation_handlers(client: TelegramClient):
                                         c.execute("INSERT OR REPLACE INTO managers (user_id, username) VALUES (?, ?)", (uid, uname))
                                 
                                 await event.reply(f"✅ **Manager Authorized!**\n**User ID:** `{uid}`\n**Username:** `@{uname}`" if uname else f"✅ **Manager Authorized!**\n**User ID:** `{uid}`")
+                                
+                                # Send welcome DM to the new manager from the userbot!
+                                welcome_msg = (
+                                    "🎉 **Congratulations! You have been authorized as a Manager!**\n\n"
+                                    "You can now configure target pairs and instruct the userbot to join groups directly through this chat!\n\n"
+                                    "🛠️ **Available Commands:**\n"
+                                    "• `.join <link_or_username>`: Request the userbot to join a group or channel.\n"
+                                    "• `.pair <source> <target>` (or `.addpair`): Link a source chat to a target chat for live forwarding.\n"
+                                    "• `.delpair <pair_id>`: Delete a target pair.\n"
+                                    "• `.pairs` (or `.listpairs`): List all active target pairs.\n"
+                                    "• `.setpair <pair_id> <live/mon/mir> <1/0>`: Turn settings on (1) or off (0).\n\n"
+                                    "💬 **Group Joining Wizard:**\n"
+                                    "Simply send any Telegram group link or username (e.g. `t.me/cctest` or `@cctest`) to this chat, and I will automatically guide you on how to join and configure it!"
+                                )
+                                try:
+                                    await client.send_message(user_entity, welcome_msg)
+                                except Exception as welcome_err:
+                                    logger.error(f"Failed to send welcome message to new manager {uid}: {welcome_err}")
                             except Exception as e:
                                 await event.reply(f"❌ Failed to authorize manager: {e}")
                             return
@@ -2398,7 +2416,7 @@ def setup_automation_handlers(client: TelegramClient):
             await process_automation_pipeline(client, [m], m.chat_id)
 @bot.message_handler(commands=['start', 'dash'])
 def cmd_start(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_authorized_manager(message.from_user.id):
         return
     bot.send_message(
         message.chat.id,
@@ -2409,7 +2427,7 @@ def cmd_start(message):
 
 @bot.message_handler(commands=["list"])
 def cmd_list(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_authorized_manager(message.from_user.id):
         return
     
     if not userbot or not userbot.is_connected():
@@ -2444,7 +2462,7 @@ def cmd_list(message):
 @bot.message_handler(commands=['extract'])
 def cmd_extract_media(message):
     """Retrieves media from your Vault using source message ID"""
-    if message.from_user.id != ADMIN_ID: return
+    if not is_authorized_manager(message.from_user.id): return
     try:
         args = message.text.split()
         if len(args) < 2: 
@@ -2705,7 +2723,7 @@ async def finalize_pair_task(call, uid):
 def handle_callbacks(call):
     global userbot
     uid = call.from_user.id
-    if uid != ADMIN_ID:
+    if not is_authorized_manager(uid):
         return
 
     data = call.data
@@ -3410,7 +3428,7 @@ async def complete_login(uid, client: TelegramClient, chat_id):
     else:
         bot.send_message(chat_id, f"❌ Failed to start userbot: {msg}")
 
-@bot.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and admin_states.get(m.from_user.id))
+@bot.message_handler(func=lambda m: is_authorized_manager(m.from_user.id) and admin_states.get(m.from_user.id))
 def handle_state_inputs(message):
     uid = message.from_user.id
     state = admin_states.get(uid)
@@ -4883,7 +4901,7 @@ async def main():
         while True:
             await asyncio.sleep(3600)
 
-@bot.message_handler(func=lambda m: m.from_user.id == ADMIN_ID)
+@bot.message_handler(func=lambda m: is_authorized_manager(m.from_user.id))
 def handle_admin_direct_message(message):
     text = message.text.strip() if message.text else ""
     if not text: return

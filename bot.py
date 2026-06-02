@@ -1403,6 +1403,13 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
         first_msg = messages[0]
         dest_topic_id = default_t_topic
         
+        # 0. Resolve Target Chat Entity (Anti PeerIdInvalid / Invalid Peer Error)
+        try:
+            target_entity = await resolve_target_id(client, tid)
+        except Exception as e:
+            logger.error(f"Failed to resolve target ID {tid}: {e}")
+            target_entity = int(tid)
+
         # 1. Resolve Topic Mapping
         if is_mir:
             source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
@@ -1434,17 +1441,7 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                     logger.warning(f"MIRROR: Could not resolve title for source topic {source_top}")
 
         # 2. Check if Target is a Forum
-        is_forum = False
-        try:
-            # Ensure we have the -100 prefix for entity lookup
-            real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
-            try:
-                tgt_ent = await client.get_entity(real_tid)
-                is_forum = getattr(tgt_ent, 'forum', False)
-            except:
-                tgt_ent = await client.get_entity(tid)
-                is_forum = getattr(tgt_ent, 'forum', False)
-        except: pass
+        is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
 
         # 3. Resolve Reply Header
         reply_header = None
@@ -1467,7 +1464,7 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
         for attempt in range(3):
             try:
                 sent = await client.send_message(
-                    entity=int(tid), 
+                    entity=target_entity, 
                     message=album_text, 
                     file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
                     reply_to=reply_header
@@ -1484,8 +1481,8 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                 await asyncio.sleep(2)
             except Exception as e:
                 err_msg = str(e).lower()
-                if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference"]):
-                    logger.info("🛡️ MIRROR: Protected chat detected. Using fallback...")
+                if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"]):
+                    logger.info("🛡️ MIRROR: Protected or invalid peer media detected. Using fallback...")
                     sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
                     if sent: break # Success via fallback
                 else:
@@ -1506,8 +1503,15 @@ async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_t
                 path = await client.download_media(m.media)
                 if path: downloaded.append(path)
         if downloaded:
+            # Resolve target peer first to avoid invalid peer errors
+            try:
+                target_entity = await resolve_target_id(client, tid)
+            except Exception as e:
+                logger.error(f"Failed to resolve target ID {tid} for fallback: {e}")
+                target_entity = int(tid)
+
             sent = await client.send_message(
-                entity=int(tid), message=album_text, 
+                entity=target_entity, message=album_text, 
                 file=downloaded if len(downloaded) > 1 else downloaded[0],
                 reply_to=reply_header
             )
@@ -1517,8 +1521,6 @@ async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_t
     finally:
         for p in downloaded:
             if os.path.exists(p): os.remove(p)
-
-
 
 def get_specific_media_type(media):
     if not media:
@@ -3149,12 +3151,35 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2):
                 # If it's a specific reply, use it. Otherwise, use the Topic Header ID.
                 final_reply_target = reply_to_val if reply_to_val else target_topic_anchor
 
-                sent_msg = await userbot.send_message(
-                    entity=target_chat,
-                    message=msg.message or "",
-                    file=msg.media,
-                    reply_to=int(final_reply_target) if final_reply_target else None
-                )
+                sent_msg = None
+                try:
+                    sent_msg = await userbot.send_message(
+                        entity=target_chat,
+                        message=msg.message or "",
+                        file=msg.media,
+                        reply_to=int(final_reply_target) if final_reply_target else None
+                    )
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"]):
+                        logger.info("🛡️ RELEASE: Protected or invalid peer media detected. Attempting download & upload fallback...")
+                        # Download media locally
+                        local_file = await userbot.download_media(msg)
+                        if local_file:
+                            try:
+                                sent_msg = await userbot.send_message(
+                                    entity=target_chat,
+                                    message=msg.message or "",
+                                    file=local_file,
+                                    reply_to=int(final_reply_target) if final_reply_target else None
+                                )
+                            finally:
+                                if os.path.exists(local_file):
+                                    os.remove(local_file)
+                        else:
+                            raise e
+                    else:
+                        raise e
                 
                 if sent_msg:
                     save_message_mapping(sid_ref, msg.id, tid_ref, sent_msg.id)
@@ -3162,7 +3187,6 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2):
                         c = conn.cursor()
                         p = get_placeholder()
                         c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
-                
                 sent += 1
                 if sent % 5 == 0:
                     try: bot.edit_message_text(f"🚀 Releasing `{s_title}` ({category_name})...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)

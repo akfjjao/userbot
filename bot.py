@@ -570,7 +570,7 @@ async def check_and_promote_user(client, user_id, username, text_content, reply_
             except Exception as welcome_err:
                 logger.error(f"Failed to send welcome message to new manager {user_id}: {welcome_err}")
                 
-            admin_alert = f"🔔 **Manager Promotion Alert**\n\nUser `{user_id}`" + (f" (@{username})" if username else "") + " has promoted themselves to **Manager** using the active promotion keyword."
+            admin_alert = f"🔔 **Manager Promotion Alert**\n\nUser `{user_id}`" + (f" (`@{username}`)" if username else "") + " has promoted themselves to **Manager** using the active promotion keyword."
             try:
                 bot.send_message(ADMIN_ID, admin_alert, parse_mode="Markdown")
             except Exception as notify_err:
@@ -1685,7 +1685,7 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
 
         # 1. Resolve Topic Mapping
         if is_mir:
-            source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+            source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or (first_msg.reply_to.reply_to_msg_id if first_msg.reply_to else None)
             if source_top:
                 forum = getattr(first_msg.reply_to, "forum_topic", None)
                 src_title = getattr(forum, "title", None)

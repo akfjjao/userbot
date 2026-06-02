@@ -1,7 +1,10 @@
 #gimini
 import os
+import uuid
 from collections import deque
 import asyncio
+
+INSTANCE_ID = str(uuid.uuid4())
 import threading
 import logging
 import sqlite3
@@ -396,6 +399,10 @@ def init_db():
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+    try:
+        cleanup_duplicate_pairs()
+    except Exception as e:
+        logger.error(f"Error calling cleanup_duplicate_pairs in init_db: {e}")
     logger.info("DB initialized")
 
 def is_user_banned(user_id, username=None):
@@ -464,10 +471,63 @@ def set_setting(key, value):
                 (key, str(value))
             )
 
+def cleanup_duplicate_pairs():
+    """Removes duplicate pairs from target_pairs table, keeping only the first one."""
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, source_id, source_topic_id, target_id, target_topic_id FROM target_pairs")
+            rows = c.fetchall()
+            
+            seen = set()
+            to_delete = []
+            for row in rows:
+                row_id, sid, s_topic, tid, t_topic = row
+                s_topic_val = int(s_topic) if s_topic is not None else None
+                t_topic_val = int(t_topic) if t_topic is not None else None
+                key = (sid, s_topic_val, tid, t_topic_val)
+                if key in seen:
+                    to_delete.append(row_id)
+                else:
+                    seen.add(key)
+            
+            if to_delete:
+                logger.info(f"DB_CLEANUP: Found {len(to_delete)} duplicate target pairs. Deleting...")
+                p = get_placeholder()
+                for rid in to_delete:
+                    c.execute(f"DELETE FROM target_pairs WHERE id = {p}", (rid,))
+                logger.info("DB_CLEANUP: Duplicates removed successfully.")
+    except Exception as e:
+        logger.error(f"DB_CLEANUP: Error cleaning duplicate pairs: {e}")
+
 def add_target_pair(sid, source_topic_id, tid, target_topic_id, s_title, t_title):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
+        
+        # Check if exists (handling NULLs safely)
+        query = "SELECT 1 FROM target_pairs WHERE source_id = ? AND target_id = ?"
+        params = [sid, tid]
+        if source_topic_id is not None:
+            query += " AND source_topic_id = ?"
+            params.append(source_topic_id)
+        else:
+            query += " AND source_topic_id IS NULL"
+            
+        if target_topic_id is not None:
+            query += " AND target_topic_id = ?"
+            params.append(target_topic_id)
+        else:
+            query += " AND target_topic_id IS NULL"
+            
+        if USING_POSTGRES:
+            query = query.replace("?", "%s")
+            
+        c.execute(query, tuple(params))
+        if c.fetchone():
+            logger.info(f"Pair already exists (Source: {sid}, Target: {tid}). Skipping insertion.")
+            return
+
         if USING_POSTGRES:
             c.execute(
                 "INSERT INTO target_pairs (source_id, source_topic_id, target_id, target_topic_id, source_title, target_title) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
@@ -478,6 +538,48 @@ def add_target_pair(sid, source_topic_id, tid, target_topic_id, s_title, t_title
                 "INSERT INTO target_pairs (source_id, source_topic_id, target_id, target_topic_id, source_title, target_title) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                 (sid, source_topic_id, tid, target_topic_id, s_title, t_title)
             )
+
+async def instance_coordinator():
+    logger.info(f"COORDINATOR: Started with Instance ID: {INSTANCE_ID}")
+    try:
+        set_setting("active_instance_id", INSTANCE_ID)
+        set_setting("active_instance_heartbeat", str(int(time.time())))
+        logger.info("COORDINATOR: Registered this instance as active.")
+    except Exception as e:
+        logger.error(f"COORDINATOR: Startup registration failed: {e}")
+
+    await asyncio.sleep(20)
+    
+    while True:
+        try:
+            db_active_id = get_setting("active_instance_id")
+            db_heartbeat_str = get_setting("active_instance_heartbeat")
+            
+            now = int(time.time())
+            
+            if db_active_id == INSTANCE_ID:
+                set_setting("active_instance_heartbeat", str(now))
+            else:
+                is_recent = False
+                if db_heartbeat_str:
+                    try:
+                        db_hb = int(db_heartbeat_str)
+                        if now - db_hb < 60:
+                            is_recent = True
+                    except ValueError:
+                        pass
+                
+                if is_recent:
+                    logger.warning(f"COORDINATOR: Detected another active instance (ID: {db_active_id}) with recent heartbeat. Exiting gracefully to prevent duplication.")
+                    os._exit(0)
+                else:
+                    logger.info(f"COORDINATOR: Detected stale active instance (ID: {db_active_id}). Reclaiming active status.")
+                    set_setting("active_instance_id", INSTANCE_ID)
+                    set_setting("active_instance_heartbeat", str(now))
+        except Exception as e:
+            logger.error(f"COORDINATOR: Error in coordination loop: {e}")
+        
+        await asyncio.sleep(20)
 
 def save_topic_mapping(s_chat, s_topic, t_chat, t_topic):
     with db_conn() as conn:
@@ -1480,20 +1582,61 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
             except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
                 await asyncio.sleep(2)
             except Exception as e:
-                err_msg = str(e).lower()
-                if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"]):
-                    logger.info("🛡️ MIRROR: Protected or invalid peer media detected. Using fallback...")
-                    sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
-                    if sent: break # Success via fallback
-                else:
-                    logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
-                    if attempt == 2: # Last attempt
-                        logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
+                # If we had a reply_header set, attempt to fallback/downgrade reply first
+                if reply_header is not None:
+                    next_reply_header = None
+                    if is_forum and dest_topic_id and reply_header != int(dest_topic_id):
+                        next_reply_header = int(dest_topic_id)
+                    
+                    logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={reply_header} ({e}). Retrying with reply_to={next_reply_header}...")
+                    try:
+                        sent = await client.send_message(
+                            entity=target_entity, 
+                            message=album_text, 
+                            file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
+                            reply_to=next_reply_header
+                        )
+                        if sent:
+                            first_id = sent[0].id if isinstance(sent, list) else sent.id
+                            logger.info(f"✅ MIRROR: Sent after reply downgrade to {tid} -> MSG ID: {first_id}")
+                            save_message_mapping(sid, first_msg.id, tid, first_id)
+                            break
+                    except Exception as e2:
+                        if next_reply_header is not None:
+                            logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={next_reply_header} ({e2}). Retrying with reply_to=None...")
+                            try:
+                                sent = await client.send_message(
+                                    entity=target_entity, 
+                                    message=album_text, 
+                                    file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
+                                    reply_to=None
+                                )
+                                if sent:
+                                    first_id = sent[0].id if isinstance(sent, list) else sent.id
+                                    logger.info(f"✅ MIRROR: Sent after final reply clear to {tid} -> MSG ID: {first_id}")
+                                    save_message_mapping(sid, first_msg.id, tid, first_id)
+                                    break
+                            except Exception as e3:
+                                e = e3
+                        else:
+                            e = e2
+                
+                # If still failed, check if we need to do fallback download & upload
+                if not sent:
+                    err_msg = str(e).lower()
+                    if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"]):
+                        logger.info("🛡️ MIRROR: Protected or invalid peer media detected. Using fallback...")
+                        sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header, dest_topic_id=dest_topic_id)
+                        if sent: break # Success via fallback
+                    else:
+                        logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
+                        if attempt == 2: # Last attempt
+                            logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
         
     except Exception as e:
         logger.error(f"Global Mirror Error: {e}")
 
-async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header):
+async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header, dest_topic_id=None):
     """Downloads and re-uploads protected content."""
     import os
     downloaded = []
@@ -1510,11 +1653,41 @@ async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_t
                 logger.error(f"Failed to resolve target ID {tid} for fallback: {e}")
                 target_entity = int(tid)
 
-            sent = await client.send_message(
-                entity=target_entity, message=album_text, 
-                file=downloaded if len(downloaded) > 1 else downloaded[0],
-                reply_to=reply_header
-            )
+            is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
+            sent = None
+            try:
+                sent = await client.send_message(
+                    entity=target_entity, message=album_text, 
+                    file=downloaded if len(downloaded) > 1 else downloaded[0],
+                    reply_to=reply_header
+                )
+            except Exception as e:
+                if reply_header is not None:
+                    next_reply_header = None
+                    if is_forum and dest_topic_id and reply_header != int(dest_topic_id):
+                        next_reply_header = int(dest_topic_id)
+                    
+                    logger.warning(f"⚠️ FALLBACK: Failed to send with reply_to={reply_header} ({e}). Retrying with reply_to={next_reply_header}...")
+                    try:
+                        sent = await client.send_message(
+                            entity=target_entity, message=album_text, 
+                            file=downloaded if len(downloaded) > 1 else downloaded[0],
+                            reply_to=next_reply_header
+                        )
+                    except Exception as e2:
+                        if next_reply_header is not None:
+                            logger.warning(f"⚠️ FALLBACK: Failed to send with reply_to={next_reply_header} ({e2}). Retrying with reply_to=None...")
+                            try:
+                                sent = await client.send_message(
+                                    entity=target_entity, message=album_text, 
+                                    file=downloaded if len(downloaded) > 1 else downloaded[0],
+                                    reply_to=None
+                                )
+                            except Exception as e3:
+                                logger.error(f"FALLBACK: Failed to send even with reply_to=None: {e3}")
+                        else:
+                            logger.error(f"FALLBACK: Failed to send after clearing reply: {e2}")
+
             if sent:
                 first_id = sent[0].id if isinstance(sent, list) else sent.id
                 save_message_mapping(sid, first_msg.id, tid, first_id)
@@ -3160,26 +3333,89 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2):
                         reply_to=int(final_reply_target) if final_reply_target else None
                     )
                 except Exception as e:
-                    err_msg = str(e).lower()
-                    if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"]):
-                        logger.info("🛡️ RELEASE: Protected or invalid peer media detected. Attempting download & upload fallback...")
-                        # Download media locally
-                        local_file = await userbot.download_media(msg)
-                        if local_file:
-                            try:
-                                sent_msg = await userbot.send_message(
-                                    entity=target_chat,
-                                    message=msg.message or "",
-                                    file=local_file,
-                                    reply_to=int(final_reply_target) if final_reply_target else None
-                                )
-                            finally:
-                                if os.path.exists(local_file):
-                                    os.remove(local_file)
+                    # If we had a reply target, attempt to fallback/downgrade reply first
+                    if final_reply_target is not None:
+                        is_forum = getattr(target_chat, 'forum', False) if not isinstance(target_chat, int) else False
+                        next_reply = None
+                        if is_forum and target_topic_anchor and int(final_reply_target) != int(target_topic_anchor):
+                            next_reply = int(target_topic_anchor)
+                        
+                        logger.warning(f"⚠️ RELEASE: Failed to send with reply_to={final_reply_target} ({e}). Retrying with reply_to={next_reply}...")
+                        try:
+                            sent_msg = await userbot.send_message(
+                                entity=target_chat,
+                                message=msg.message or "",
+                                file=msg.media,
+                                reply_to=next_reply
+                            )
+                        except Exception as e2:
+                            if next_reply is not None:
+                                logger.warning(f"⚠️ RELEASE: Failed to send with reply_to={next_reply} ({e2}). Retrying with reply_to=None...")
+                                try:
+                                    sent_msg = await userbot.send_message(
+                                        entity=target_chat,
+                                        message=msg.message or "",
+                                        file=msg.media,
+                                        reply_to=None
+                                    )
+                                except Exception as e3:
+                                    e = e3
+                            else:
+                                e = e2
+                    
+                    # If still failed, check if we need to do fallback download & upload
+                    if not sent_msg:
+                        err_msg = str(e).lower()
+                        if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"]):
+                            logger.info("🛡️ RELEASE: Protected or invalid peer media detected. Attempting download & upload fallback...")
+                            local_file = await userbot.download_media(msg)
+                            if local_file:
+                                try:
+                                    sent_msg = await userbot.send_message(
+                                        entity=target_chat,
+                                        message=msg.message or "",
+                                        file=local_file,
+                                        reply_to=int(final_reply_target) if final_reply_target else None
+                                    )
+                                except Exception as fe:
+                                    # Downgrade in fallback as well
+                                    if final_reply_target is not None:
+                                        is_forum = getattr(target_chat, 'forum', False) if not isinstance(target_chat, int) else False
+                                        next_reply = None
+                                        if is_forum and target_topic_anchor and int(final_reply_target) != int(target_topic_anchor):
+                                            next_reply = int(target_topic_anchor)
+                                        
+                                        logger.warning(f"⚠️ RELEASE FALLBACK: Failed to send with reply_to={final_reply_target} ({fe}). Retrying with reply_to={next_reply}...")
+                                        try:
+                                            sent_msg = await userbot.send_message(
+                                                entity=target_chat,
+                                                message=msg.message or "",
+                                                file=local_file,
+                                                reply_to=next_reply
+                                            )
+                                        except Exception as fe2:
+                                            if next_reply is not None:
+                                                logger.warning(f"⚠️ RELEASE FALLBACK: Failed to send with reply_to={next_reply} ({fe2}). Retrying with reply_to=None...")
+                                                try:
+                                                    sent_msg = await userbot.send_message(
+                                                        entity=target_chat,
+                                                        message=msg.message or "",
+                                                        file=local_file,
+                                                        reply_to=None
+                                                    )
+                                                except Exception as fe3:
+                                                    raise fe3
+                                            else:
+                                                raise fe2
+                                    else:
+                                        raise fe
+                                finally:
+                                    if os.path.exists(local_file):
+                                        os.remove(local_file)
+                            else:
+                                raise e
                         else:
                             raise e
-                    else:
-                        raise e
                 
                 if sent_msg:
                     save_message_mapping(sid_ref, msg.id, tid_ref, sent_msg.id)
@@ -3742,6 +3978,7 @@ async def main():
         logger.error(f"Error booting log bots: {e}")
 
     asyncio.create_task(userbot_watchdog())
+    asyncio.create_task(instance_coordinator())
     threading.Thread(target=keep_alive_worker, daemon=True).start()
 
     # Try to start existing session

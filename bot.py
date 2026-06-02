@@ -1455,6 +1455,9 @@ async def get_chat_selection_markup(prefix, page=0):
     if end < len(chats): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"{prefix}_page_{page+1}"))
     if nav: markup.add(*nav)
     
+    # Dynamic Chat Search button
+    markup.add(InlineKeyboardButton("🔍 Search Group", callback_data=f"sel_search|{prefix}"))
+    
     markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="pairs_main"))
     return markup
 
@@ -1945,7 +1948,75 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                     else:
                         await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid, pre_downloaded=downloaded_files if has_media else None)
                 else:
-                    await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid)
+                    # Unrestricted flow: perform standard Telegram forward!
+                    try:
+                        src_peer = await client.get_input_entity(int(sid))
+                        tgt_peer = await client.get_input_entity(int(tid))
+                        
+                        dest_topic_id = t_topic
+                        if is_mir:
+                            source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or (first_msg.reply_to.reply_to_msg_id if first_msg.reply_to else None)
+                            if source_top:
+                                forum = getattr(first_msg.reply_to, "forum_topic", None)
+                                src_title = getattr(forum, "title", None)
+                                src_icon = None
+                                if not src_title:
+                                    try:
+                                        resolved_sid = await resolve_target_id(client, sid)
+                                        res = await client(functions.messages.GetForumTopicsRequest(
+                                            peer=resolved_sid,
+                                            offset_date=0,
+                                            offset_id=0,
+                                            offset_topic=0,
+                                            limit=100
+                                        ))
+                                        for t in res.topics:
+                                            if t.id == source_top:
+                                                src_title = t.title
+                                                src_icon = getattr(t, "icon_emoji_id", None)
+                                                break
+                                    except Exception: pass
+                                
+                                if src_title:
+                                    logger.info(f"FORWARD: Resolving target topic for title: '{src_title}'")
+                                    dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
+
+                        import random
+                        random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in messages]
+                        
+                        target_entity = await resolve_target_id(client, tid)
+                        is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
+                        
+                        top_msg_id_val = None
+                        if is_forum:
+                            top_msg_id_val = int(dest_topic_id) if dest_topic_id else None
+                        
+                        # Native standard forward
+                        fwd_res = await client(functions.messages.ForwardMessagesRequest(
+                            from_peer=src_peer,
+                            id=[msg.id for msg in messages],
+                            to_peer=tgt_peer,
+                            random_id=random_ids,
+                            top_msg_id=top_msg_id_val
+                        ))
+                        
+                        if fwd_res:
+                            fwd_msgs = []
+                            if hasattr(fwd_res, 'updates'):
+                                for u in fwd_res.updates:
+                                    if type(u).__name__ in ["UpdateNewMessage", "UpdateNewChannelMessage"]:
+                                        fwd_msgs.append(u.message)
+                            
+                            if len(fwd_msgs) == len(messages):
+                                for orig_m, fwd_m in zip(messages, fwd_msgs):
+                                    save_message_mapping(sid, orig_m.id, tid, fwd_m.id)
+                                    logger.info(f"✅ FORWARD: Standard forwarded message {orig_m.id} -> Target {tid} (Msg ID: {fwd_m.id})")
+                            else:
+                                logger.info(f"✅ FORWARD: Standard forwarded messages from source {sid} to target {tid}")
+                                
+                    except Exception as fwd_err:
+                        logger.error(f"Failed standard forward from {sid} to {tid}: {fwd_err}. Falling back to custom mirror.")
+                        await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid)
 
             # Execution Step C: Backup Storage Vault Allocation
             if is_mon and not already_vaulted:
@@ -3008,6 +3079,83 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id)
         login_data.pop(uid, None)
         bot.edit_message_text("✅ Chat joined. No automation pairs were created.", call.message.chat.id, call.message.message_id)
+        return
+
+    elif data.startswith("sel_search|"):
+        bot.answer_callback_query(call.id)
+        prefix = data.split("|")[1]
+        
+        bot.edit_message_text(
+            "🔍 *Search Group or Channel*\n\nPlease send me the exact name or keyword of the group/channel you want to search:",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        def process_chat_search_query(message):
+            if not is_authorized_manager(message.from_user.id):
+                return
+            query = message.text.strip() if message.text else ""
+            if not query:
+                bot.reply_to(message, "❌ Search cancelled or invalid input.")
+                return
+            
+            async def search_dialogs_task():
+                try:
+                    search_msg = bot.send_message(message.chat.id, "🔍 Searching dialogues...")
+                    
+                    chats = []
+                    async for dialog in userbot.iter_dialogs(limit=500):
+                        entity = dialog.entity
+                        if isinstance(entity, (types.Chat, types.Channel, types.User)):
+                            title = ""
+                            if isinstance(entity, (types.Chat, types.Channel)):
+                                title = entity.title or ""
+                            elif isinstance(entity, types.User):
+                                title = f"{entity.first_name or ''} {entity.last_name or ''}".strip()
+                            
+                            if query.lower() in title.lower():
+                                chats.append(dialog)
+                    
+                    bot.delete_message(message.chat.id, search_msg.message_id)
+                    
+                    if not chats:
+                        bot.send_message(message.chat.id, f"❌ No group or channel found matching `{query}`.", parse_mode="Markdown")
+                        return
+                    
+                    markup = InlineKeyboardMarkup(row_width=1)
+                    for dialog in chats[:15]:
+                        chat = dialog.entity
+                        is_forum = getattr(chat, "forum", False)
+                        
+                        if isinstance(chat, types.Channel):
+                            if is_forum: icon = "🏛️"; t = f"『 TOPIC 』 {chat.title}"
+                            elif chat.broadcast: icon = "📢"; t = chat.title
+                            else: icon = "👥"; t = chat.title
+                        elif isinstance(chat, types.Chat):
+                            icon = "👥"; t = chat.title
+                        elif isinstance(chat, types.User):
+                            icon = "👤"; t = f"{chat.first_name or ''} {chat.last_name or ''}".strip()
+                        else:
+                            icon = "💬"; t = "Unknown"
+                            
+                        markup.add(
+                            InlineKeyboardButton(
+                                f"{icon} {t}",
+                                callback_data=f"{prefix}_{chat.id}"
+                            )
+                        )
+                        
+                    markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="dash_main"))
+                    bot.send_message(message.chat.id, f"🔍 *Search Results for '{query}':*", reply_markup=markup, parse_mode="Markdown")
+                    
+                except Exception as err:
+                    logger.error(f"Search task failed: {err}")
+                    bot.send_message(message.chat.id, f"❌ Search error: {err}")
+            
+            asyncio.run_coroutine_threadsafe(search_dialogs_task(), loop)
+            
+        bot.register_next_step_handler(call.message, process_chat_search_query)
         return
 
     elif data.startswith("join_set_source|"):

@@ -1918,8 +1918,250 @@ def setup_automation_handlers(client: TelegramClient):
             except Exception as e:
                 logger.error(f"Failed to get_me() for userbot: {e}")
 
-        # Ignore all outgoing messages sent by the userbot itself to prevent loops and media leakage
         me = getattr(client, '_me', None)
+
+        # Userbot commands for target pairs configuration
+        if m.text and m.text.strip().startswith('.'):
+            is_admin = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id)
+            if is_admin:
+                text = m.text.strip()
+                parts = text.split()
+                cmd = parts[0].lower()
+                
+                if cmd in ['.addpair', '.pair', '.delpair', '.listpairs', '.pairs', '.setpair']:
+                    try:
+                        if cmd in ['.addpair', '.pair']:
+                            if len(parts) < 3:
+                                await event.reply("❌ **Usage:** `.addpair <source> <target>`\n(Source/Target can be usernames, links, topic links, or numeric IDs)")
+                                return
+                            
+                            source_raw = parts[1]
+                            target_raw = parts[2]
+                            await event.reply("⏳ **Resolving source and target entities...**")
+                            
+                            s_entity, s_topic = await resolve_chat_and_topic(client, source_raw)
+                            t_entity, t_topic = await resolve_chat_and_topic(client, target_raw)
+                            
+                            s_title = getattr(s_entity, 'title', None) or getattr(s_entity, 'first_name', None) or str(s_entity.id)
+                            t_title = getattr(t_entity, 'title', None) or getattr(t_entity, 'first_name', None) or str(t_entity.id)
+                            
+                            from telethon.utils import get_peer_id
+                            sid = get_peer_id(s_entity)
+                            tid = get_peer_id(t_entity)
+                            
+                            add_target_pair(sid, s_topic, tid, t_topic, s_title, t_title)
+                            
+                            # Update target pair to set is_live = 1 and is_mirror = 1 by default
+                            with db_conn() as conn:
+                                c = conn.cursor()
+                                p = get_placeholder()
+                                query = f"UPDATE target_pairs SET is_live = 1, is_mirror = 1 WHERE source_id = {p} AND target_id = {p}"
+                                params = [sid, tid]
+                                if s_topic is not None:
+                                    query += f" AND source_topic_id = {p}"
+                                    params.append(s_topic)
+                                else:
+                                    query += " AND source_topic_id IS NULL"
+                                    
+                                if t_topic is not None:
+                                    query += f" AND target_topic_id = {p}"
+                                    params.append(t_topic)
+                                else:
+                                    query += " AND target_topic_id IS NULL"
+                                c.execute(query, tuple(params))
+                                
+                            # Fetch pair ID
+                            pair_id = None
+                            with db_conn() as conn:
+                                c = conn.cursor()
+                                p = get_placeholder()
+                                query = f"SELECT id FROM target_pairs WHERE source_id = {p} AND target_id = {p}"
+                                params = [sid, tid]
+                                if s_topic is not None:
+                                    query += f" AND source_topic_id = {p}"
+                                    params.append(s_topic)
+                                else:
+                                    query += " AND source_topic_id IS NULL"
+                                if t_topic is not None:
+                                    query += f" AND target_topic_id = {p}"
+                                    params.append(t_topic)
+                                else:
+                                    query += " AND target_topic_id IS NULL"
+                                c.execute(query, tuple(params))
+                                row = c.fetchone()
+                                if row:
+                                    pair_id = row[0]
+                            
+                            await event.reply(
+                                f"✅ **Target Pair Added & Activated!**\n\n"
+                                f"**ID:** `{pair_id}`\n"
+                                f"**Source:** `{s_title}`" + (f" (Topic: `{s_topic}`)" if s_topic else "") + f" (ID: `{sid}`)\n"
+                                f"**Target:** `{t_title}`" + (f" (Topic: `{t_topic}`)" if t_topic else "") + f" (ID: `{tid}`)\n\n"
+                                f"⚡ *Live forwarding and mirroring enabled by default.*"
+                            )
+                            return
+                            
+                        elif cmd == '.delpair':
+                            if len(parts) < 2:
+                                await event.reply("❌ **Usage:** `.delpair <pair_id>` or `.delpair <source> <target>`")
+                                return
+                            
+                            # If they provided a pair ID
+                            if len(parts) == 2 and parts[1].isdigit():
+                                pid = int(parts[1])
+                                row = get_target_pair(pid)
+                                if not row:
+                                    await event.reply(f"❌ Pair ID `{pid}` not found.")
+                                    return
+                                with db_conn() as conn:
+                                    c = conn.cursor()
+                                    p = get_placeholder()
+                                    c.execute(f"DELETE FROM target_pairs WHERE id = {p}", (pid,))
+                                await event.reply(f"✅ Deleted pair ID `{pid}` (`{row[3]}` -> `{row[4]}`).")
+                                return
+                            
+                            if len(parts) < 3:
+                                await event.reply("❌ **Usage:** `.delpair <pair_id>` or `.delpair <source> <target>`")
+                                return
+                            
+                            source_raw = parts[1]
+                            target_raw = parts[2]
+                            await event.reply("⏳ **Resolving source and target...**")
+                            
+                            s_entity, s_topic = await resolve_chat_and_topic(client, source_raw)
+                            t_entity, t_topic = await resolve_chat_and_topic(client, target_raw)
+                            
+                            from telethon.utils import get_peer_id
+                            sid = get_peer_id(s_entity)
+                            tid = get_peer_id(t_entity)
+                            
+                            pair_id = None
+                            with db_conn() as conn:
+                                c = conn.cursor()
+                                p = get_placeholder()
+                                query = f"SELECT id FROM target_pairs WHERE source_id = {p} AND target_id = {p}"
+                                params = [sid, tid]
+                                if s_topic is not None:
+                                    query += f" AND source_topic_id = {p}"
+                                    params.append(s_topic)
+                                else:
+                                    query += " AND source_topic_id IS NULL"
+                                if t_topic is not None:
+                                    query += f" AND target_topic_id = {p}"
+                                    params.append(t_topic)
+                                else:
+                                    query += " AND target_topic_id IS NULL"
+                                c.execute(query, tuple(params))
+                                row = c.fetchone()
+                                if row:
+                                    pair_id = row[0]
+                            
+                            if not pair_id:
+                                await event.reply("❌ Pair not found matching those settings.")
+                                return
+                            
+                            with db_conn() as conn:
+                                c = conn.cursor()
+                                p = get_placeholder()
+                                c.execute(f"DELETE FROM target_pairs WHERE id = {p}", (pair_id,))
+                            
+                            await event.reply(f"✅ Deleted pair ID `{pair_id}` (`{s_entity.title}` -> `{t_entity.title}`).")
+                            return
+                            
+                        elif cmd in ['.listpairs', '.pairs']:
+                            pairs = []
+                            with db_conn() as conn:
+                                c = conn.cursor()
+                                c.execute("SELECT id, source_title, source_topic_id, target_title, target_topic_id, is_live, is_mirror, is_monitoring FROM target_pairs ORDER BY id ASC")
+                                pairs = c.fetchall()
+                            
+                            if not pairs:
+                                await event.reply("📭 No active target pairs configured.")
+                                return
+                            
+                            text_lines = ["📋 **Configured Target Pairs:**\n"]
+                            for r in pairs:
+                                pid, s_title, s_topic, t_title, t_topic, live, mir, mon = r
+                                status = []
+                                if live: status.append("⚡Live")
+                                if mir: status.append("🔄Mirror")
+                                if mon: status.append("👁️Mon")
+                                status_str = f"[{', '.join(status)}]" if status else "[Disabled]"
+                                
+                                s_desc = f"{s_title}" + (f" (Topic: {s_topic})" if s_topic else "")
+                                t_desc = f"{t_title}" + (f" (Topic: {t_topic})" if t_topic else "")
+                                
+                                text_lines.append(f"🔹 **ID {pid}**: `{s_desc}` ➡️ `{t_desc}` {status_str}")
+                            
+                            full_text = "\n".join(text_lines)
+                            if len(full_text) > 4000:
+                                chunk = []
+                                for line in text_lines:
+                                    if len("\n".join(chunk) + "\n" + line) > 4000:
+                                        await event.reply("\n".join(chunk))
+                                        chunk = [line]
+                                    else:
+                                        chunk.append(line)
+                                if chunk:
+                                    await event.reply("\n".join(chunk))
+                            else:
+                                await event.reply(full_text)
+                            return
+                            
+                        elif cmd == '.setpair':
+                            if len(parts) < 4:
+                                await event.reply("❌ **Usage:** `.setpair <pair_id> <live/mon/mir> <1/0>`")
+                                return
+                            
+                            pid_str = parts[1]
+                            setting = parts[2].lower()
+                            val_str = parts[3]
+                            
+                            if not pid_str.isdigit() or not val_str.isdigit():
+                                await event.reply("❌ Pair ID and value must be integers.")
+                                return
+                            
+                            pid = int(pid_str)
+                            val = int(val_str)
+                            
+                            if val not in [0, 1]:
+                                await event.reply("❌ Value must be `0` (off) or `1` (on).")
+                                return
+                            
+                            if setting not in ['live', 'mon', 'monitoring', 'mir', 'mirror']:
+                                await event.reply("❌ Setting must be one of: `live`, `mon`/`monitoring`, `mir`/`mirror`.")
+                                return
+                            
+                            col = None
+                            if setting == 'live':
+                                col = 'is_live'
+                            elif setting in ['mon', 'monitoring']:
+                                col = 'is_monitoring'
+                            elif setting in ['mir', 'mirror']:
+                                col = 'is_mirror'
+                            
+                            row = get_target_pair(pid)
+                            if not row:
+                                await event.reply(f"❌ Pair ID `{pid}` not found.")
+                                return
+                            
+                            with db_conn() as conn:
+                                c = conn.cursor()
+                                p = get_placeholder()
+                                c.execute(f"UPDATE target_pairs SET {col} = {p} WHERE id = {p}", (val, pid))
+                            
+                            if col == 'is_monitoring' and val == 1:
+                                asyncio.create_task(run_collection(ADMIN_ID, pid, limit=None))
+                                await event.reply(f"✅ Updated pair ID `{pid}`: set `{col}` to `{val}`. Also started background history scan.")
+                            else:
+                                await event.reply(f"✅ Updated pair ID `{pid}`: set `{col}` to `{val}`.")
+                            return
+                    except Exception as err:
+                        logger.error(f"Command execution error: {err}")
+                        await event.reply(f"❌ **Command Error:** {err}")
+                        return
+
+        # Ignore all outgoing messages sent by the userbot itself to prevent loops and media leakage
         if m.out or (me and m.sender_id == me.id):
             return
 
@@ -2116,6 +2358,7 @@ def cmd_logout(message):
     bot.send_message(message.chat.id, "⚠️ *Logout Confirmation*\n\nThis will stop the userbot and delete the session from the database. Are you sure?", reply_markup=markup, parse_mode="Markdown")
 
 def parse_telegram_link(text):
+    import re
     text = text.strip()
     # Private Invite links
     m = re.search(r'(?:t\.me|telegram\.me)/joinchat/([a-zA-Z0-9_\-]+)', text)
@@ -2128,6 +2371,63 @@ def parse_telegram_link(text):
     m = re.search(r'^@([a-zA-Z0-9_]{5,})$', text)
     if m: return {"type": "username", "username": m.group(1)}
     return None
+
+async def resolve_chat_and_topic(client, input_str):
+    import re
+    input_str = input_str.strip()
+    topic_id = None
+    
+    # Check for explicit colon topic_id at the end, e.g. chat:123
+    if ":" in input_str:
+        parts = input_str.rsplit(":", 1)
+        if parts[1].isdigit():
+            input_str = parts[0]
+            topic_id = int(parts[1])
+            
+    # Try parsing telegram URL for topic path:
+    m_private = re.search(r'(?:t\.me|telegram\.me)/c/(\d+)/(\d+)', input_str)
+    if m_private:
+        chat_ref = int(f"-100{m_private.group(1)}")
+        if topic_id is None:
+            topic_id = int(m_private.group(2))
+        entity = await resolve_target_id(client, chat_ref)
+        return entity, topic_id
+        
+    m_public = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,})/(\d+)', input_str)
+    if m_public:
+        chat_ref = m_public.group(1)
+        if topic_id is None:
+            topic_id = int(m_public.group(2))
+        entity = await resolve_target_id(client, chat_ref)
+        return entity, topic_id
+
+    # Fallback to parse_telegram_link logic
+    parsed = parse_telegram_link(input_str)
+    if parsed:
+        if parsed["type"] == "invite":
+            from telethon.tl.functions.messages import ImportChatInviteRequest
+            try:
+                result = await client(ImportChatInviteRequest(parsed["hash"]))
+                if hasattr(result, "chats") and result.chats:
+                    entity = result.chats[0]
+                else:
+                    entity = await resolve_target_id(client, input_str)
+            except errors.UserAlreadyParticipantError:
+                from telethon.tl.functions.messages import CheckChatInviteRequest
+                try:
+                    invite_info = await client(CheckChatInviteRequest(parsed["hash"]))
+                    entity = invite_info.chat
+                except Exception:
+                    entity = await resolve_target_id(client, input_str)
+            except Exception as e:
+                raise Exception(f"Failed to join invite link: {e}")
+        else: # type == username
+            entity = await resolve_target_id(client, parsed["username"])
+    else:
+        # Numeric ID or raw string
+        entity = await resolve_target_id(client, input_str)
+        
+    return entity, topic_id
 
 async def join_chat_task(call, link_type, value):
     try:

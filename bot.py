@@ -1066,7 +1066,7 @@ def get_all_vault_stats():
 # -----------------------------
 # Global State
 # -----------------------------
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 userbot = None
 
 admin_states = {}
@@ -2792,7 +2792,7 @@ def handle_state_inputs(message):
         bot.send_message(message.chat.id, "⏳ Verifying Log Bot Token...")
         
         try:
-            temp_bot = telebot.TeleBot(token)
+            temp_bot = telebot.TeleBot(token, threaded=False)
             bot_info = temp_bot.get_me()
             
             # Save to DB
@@ -3782,7 +3782,7 @@ class LogBotManager:
                 logger.error(f"Failed to start Log Bot {username}: {e}")
 
     def add_bot(self, token):
-        new_bot = telebot.TeleBot(token)
+        new_bot = telebot.TeleBot(token, threaded=False)
         bot_info = new_bot.get_me()
         bot_id = bot_info.id
         
@@ -3799,7 +3799,7 @@ class LogBotManager:
                     logger.info(f"🚀 Log Bot @{bot_info.username} started polling.")
                     new_bot.delete_webhook(drop_pending_updates=True)
                     # Use a shorter timeout and skip pending to reduce conflict duration
-                    new_bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20, threaded=False)
+                    new_bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
                 except Exception as e:
                     if "Conflict" in str(e):
                         logger.warning(f"⚠️ Log Bot @{bot_info.username} conflict. Retrying in 15s...")
@@ -4212,7 +4212,7 @@ async def main():
                 logger.info("🚀 Starting Admin Bot polling...")
                 bot.delete_webhook(drop_pending_updates=True)
                 # Reduced timeout and conflict handling
-                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20, threaded=False)
+                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
             except Exception as e:
                 if "Conflict" in str(e):
                     logger.warning("⚠️ Main Admin Bot conflict. Retrying in 20s...")

@@ -78,10 +78,10 @@ def db_conn():
                 USING_POSTGRES = True
             except (ImportError, Exception) as e:
                 logger.error(f"PostgreSQL connection failed: {e}. Falling back to SQLite.")
-                conn = sqlite3.connect(DB_PATH)
+                conn = sqlite3.connect(DB_PATH, timeout=30)
                 USING_POSTGRES = False
         else:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, timeout=30)
             USING_POSTGRES = False
         
         yield conn
@@ -996,7 +996,7 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
 
             if (i + 1) % 5 == 0 or (i + 1) == total_groups:
                 try: sender_bot.edit_message_text(f"📊 *Status:* `{i+1}/{total}`\n✅ Success: `{success}`\n❌ Failed: `{failed}`", admin_chat_id, status_msg.message_id, reply_markup=stop_markup, parse_mode="Markdown")
-                except: pass
+                except Exception: pass
 
             await asyncio.sleep(interval)
             
@@ -1473,7 +1473,7 @@ async def start_userbot():
     try:
         if userbot:
             try: await userbot.disconnect()
-            except: pass
+            except Exception: pass
             
         userbot = TelegramClient(
             StringSession(session_string),
@@ -1527,7 +1527,7 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
         # RESOLVE ENTITY
         try:
             target_peer = await client.get_input_entity(int(log_chat_id))
-        except:
+        except Exception:
             target_peer = await client.get_entity(int(log_chat_id))
 
         # Metadata for Log Bot extraction (only on the first message of album if multiple)
@@ -1548,20 +1548,8 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
             return await vault_media(client, messages, source_chat_id, log_chat_id, t_name) # Retry
         except Exception as e:
             if any(x in str(e).lower() for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference"]):
-                logger.info(f"🛡️ VAULT: Protected chat detected. Attempting direct download/upload...")
-                # Download all if album
-                files = []
-                for m in messages:
-                    p = await client.download_media(m)
-                    if p: files.append(p)
-                
-                vaulted_result = await client.send_message(
-                    entity=target_peer,
-                    file=files if len(files) > 1 else files[0] if files else None,
-                    message=caption_text
-                )
-                for p in files:
-                    if os.path.exists(p): os.remove(p)
+                logger.warning(f"🛡️ VAULT: Protected media detected but could not forward to vault bot @{t_name}. Vaulting skipped.")
+                vaulted_result = None
             else:
                 raise e
             
@@ -1621,7 +1609,7 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                                 src_title = t.title
                                 src_icon = getattr(t, "icon_emoji_id", None)
                                 break
-                    except: pass
+                    except Exception: pass
                 
                 if src_title:
                     logger.info(f"MIRROR: Resolved source topic title: '{src_title}' (Icon: {src_icon})")
@@ -1714,81 +1702,13 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         else:
                             e = e2
                 
-                # If still failed, check if we need to do fallback download & upload
-                if not sent and not pre_downloaded:
-                    err_msg = str(e).lower()
-                    if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"]):
-                        logger.info("🛡️ MIRROR: Protected or invalid peer media detected. Using fallback...")
-                        sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header, dest_topic_id=dest_topic_id)
-                        if sent: break # Success via fallback
-                    else:
-                        logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
-                        if attempt == 2: # Last attempt
-                            logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
-                elif not sent and pre_downloaded:
-                    logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED (pre-downloaded): {e}")
+                if not sent:
+                    logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
+                    if attempt == 2: # Last attempt
+                        logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
         
     except Exception as e:
         logger.error(f"Global Mirror Error: {e}")
-
-async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header, dest_topic_id=None):
-    """Downloads and re-uploads protected content."""
-    import os
-    downloaded = []
-    try:
-        for m in messages:
-            if m.media:
-                path = await client.download_media(m.media)
-                if path: downloaded.append(path)
-        if downloaded:
-            # Resolve target peer first to avoid invalid peer errors
-            try:
-                target_entity = await resolve_target_id(client, tid)
-            except Exception as e:
-                logger.error(f"Failed to resolve target ID {tid} for fallback: {e}")
-                target_entity = int(tid)
-
-            is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
-            sent = None
-            try:
-                sent = await client.send_message(
-                    entity=target_entity, message=album_text, 
-                    file=downloaded if len(downloaded) > 1 else downloaded[0],
-                    reply_to=reply_header
-                )
-            except Exception as e:
-                if reply_header is not None:
-                    next_reply_header = None
-                    if is_forum and dest_topic_id and reply_header != int(dest_topic_id):
-                        next_reply_header = int(dest_topic_id)
-                    
-                    logger.warning(f"⚠️ FALLBACK: Failed to send with reply_to={reply_header} ({e}). Retrying with reply_to={next_reply_header}...")
-                    try:
-                        sent = await client.send_message(
-                            entity=target_entity, message=album_text, 
-                            file=downloaded if len(downloaded) > 1 else downloaded[0],
-                            reply_to=next_reply_header
-                        )
-                    except Exception as e2:
-                        if next_reply_header is not None:
-                            logger.warning(f"⚠️ FALLBACK: Failed to send with reply_to={next_reply_header} ({e2}). Retrying with reply_to=None...")
-                            try:
-                                sent = await client.send_message(
-                                    entity=target_entity, message=album_text, 
-                                    file=downloaded if len(downloaded) > 1 else downloaded[0],
-                                    reply_to=None
-                                )
-                            except Exception as e3:
-                                logger.error(f"FALLBACK: Failed to send even with reply_to=None: {e3}")
-                        else:
-                            logger.error(f"FALLBACK: Failed to send after clearing reply: {e2}")
-
-            if sent:
-                first_id = sent[0].id if isinstance(sent, list) else sent.id
-                save_message_mapping(sid, first_msg.id, tid, first_id)
-    finally:
-        for p in downloaded:
-            if os.path.exists(p): os.remove(p)
 
 def get_specific_media_type(media):
     if not media:
@@ -1867,6 +1787,16 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                     path = await client.download_media(msg.media)
                     if path:
                         downloaded_files.append(path)
+                except errors.FloodWaitError as fwe:
+                    logger.warning(f"⏳ PIPELINE FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
+                    if fwe.seconds <= 5:
+                        await asyncio.sleep(fwe.seconds)
+                        try:
+                            path = await client.download_media(msg.media)
+                            if path:
+                                downloaded_files.append(path)
+                        except Exception as e2:
+                            logger.error(f"Failed to download media after short flood wait: {e2}")
                 except Exception as e:
                     logger.error(f"Failed to download media for message {msg.id}: {e}")
 
@@ -1884,7 +1814,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
             topic_filter_id = None
             if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
                 try: topic_filter_id = int(s_topic)
-                except: pass
+                except Exception: pass
             if topic_filter_id is not None and str(msg_topic_anchor) != str(topic_filter_id):
                 continue
 
@@ -1912,41 +1842,52 @@ async def process_automation_pipeline(client, messages, source_chat_id):
 
             # Execution Step B: Live Mirror/Forward Engine Routine
             if is_live:
-                if is_protected_flow and downloaded_files:
-                    await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid, pre_downloaded=downloaded_files)
+                if is_protected_flow:
+                    has_media = any(msg.media for msg in messages)
+                    if has_media and not downloaded_files:
+                        logger.warning(f"🛡️ PIPELINE: Skipping live mirror for {tid} because media download failed/skipped.")
+                    else:
+                        await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid, pre_downloaded=downloaded_files if has_media else None)
                 else:
                     await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid)
 
             # Execution Step C: Backup Storage Vault Allocation
             if is_mon and not already_vaulted:
-                # Passes pre-downloaded files to log fleet avoiding a second round of downloads
-                if is_protected_flow and downloaded_files:
-                    bots = get_log_bots()
-                    for token, username, bot_id in bots:
-                        metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
-                        caption_text = metadata + (first_msg.message or "")
-                        try:
-                            vaulted_result = await client.send_message(
-                                entity=int(bot_id),
-                                file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
-                                message=caption_text
-                            )
-                            if vaulted_result:
-                                v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
-                                for i, v_m in enumerate(v_msgs):
-                                    orig_m = messages[i]
-                                    save_logged_media(
-                                        bot_id=int(bot_id),
-                                        log_msg_id=int(v_m.id),
-                                        source_chat_id=int(source_chat_id),
-                                        source_msg_id=int(orig_m.id),
-                                        file_id=None,
-                                        media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                                        caption=orig_m.message or "",
-                                        grouped_id=orig_m.grouped_id
+                if is_protected_flow:
+                    has_media = any(msg.media for msg in messages)
+                    if has_media and not downloaded_files:
+                        logger.warning(f"🛡️ PIPELINE: Skipping vaulting because media download failed/skipped.")
+                    else:
+                        if downloaded_files:
+                            bots = get_log_bots()
+                            for token, username, bot_id in bots:
+                                metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
+                                caption_text = metadata + (first_msg.message or "")
+                                try:
+                                    vaulted_result = await client.send_message(
+                                        entity=int(bot_id),
+                                        file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
+                                        message=caption_text
                                     )
-                        except Exception as e:
-                            logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                                    if vaulted_result:
+                                        v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+                                        for i, v_m in enumerate(v_msgs):
+                                            orig_m = messages[i]
+                                            save_logged_media(
+                                                bot_id=int(bot_id),
+                                                log_msg_id=int(v_m.id),
+                                                source_chat_id=int(source_chat_id),
+                                                source_msg_id=int(orig_m.id),
+                                                file_id=None,
+                                                media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                                                caption=orig_m.message or "",
+                                                grouped_id=orig_m.grouped_id
+                                            )
+                                except Exception as e:
+                                    logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                        else:
+                            # Text-only on protected flow
+                            asyncio.create_task(forward_to_log_bots(client, messages, sid))
                 else:
                     asyncio.create_task(forward_to_log_bots(client, messages, sid))
                 already_vaulted = True
@@ -1956,7 +1897,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
         for temp_path in downloaded_files:
             if os.path.exists(temp_path):
                 try: os.remove(temp_path)
-                except: pass
+                except Exception: pass
 
 def setup_automation_handlers(client: TelegramClient):
     if getattr(client, '_automation_handlers_registered', False):
@@ -2076,7 +2017,7 @@ def cmd_list(message):
                 bot.send_message(message.chat.id, text, parse_mode="Markdown")
             
             try: bot.delete_message(message.chat.id, status_msg.message_id)
-            except: pass
+            except Exception: pass
         except Exception as e:
             bot.send_message(message.chat.id, f"❌ Error fetching chats: {e}")
 
@@ -2374,7 +2315,7 @@ def handle_callbacks(call):
             bot.send_document(call.message.chat.id, f, caption=f"📂 Media Logs for @{username}")
         
         try: os.remove(filename)
-        except: pass
+        except Exception: pass
 
     elif data.startswith("log_bot_delete_confirm_"):
         bot_id = int(data.split("_")[-1])
@@ -2391,7 +2332,7 @@ def handle_callbacks(call):
             try:
                 log_bot_manager.bots[bot_id].stop_polling()
                 del log_bot_manager.bots[bot_id]
-            except: pass
+            except Exception: pass
             
         bot.answer_callback_query(call.id, "Log Bot Removed")
         bot.edit_message_text("📜 *Log Bot System*\nManage your backup bots and storage:", call.message.chat.id, call.message.message_id, reply_markup=log_bot_list_markup(), parse_mode="Markdown")
@@ -2693,7 +2634,7 @@ def handle_callbacks(call):
         if userbot:
             async def stop_ub():
                 try: await userbot.disconnect()
-                except: pass
+                except Exception: pass
             asyncio.run_coroutine_threadsafe(stop_ub(), loop)
         
         userbot = None
@@ -3023,12 +2964,18 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         target_chat = await resolve_target_id(userbot, sid)
         sid_resolved = target_chat.id
         
+        is_protected_flow = False
+        try:
+            is_protected_flow = getattr(target_chat, 'noforwards', False)
+        except Exception as e:
+            logger.error(f"Failed to check noforwards: {e}")
+        
         # Telethon uses iter_messages for history (newest to oldest)
         target_topic = None
         if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
             try:
                 target_topic = int(s_topic)
-            except:
+            except Exception:
                 pass
         
         # Collect matching messages first
@@ -3075,7 +3022,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                         reply_markup=markup,
                         parse_mode="Markdown"
                     )
-                except:
+                except Exception:
                     pass
             await asyncio.sleep(0.02)
             
@@ -3112,29 +3059,91 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 bot.send_message(admin_chat_id, f"🛑 History scrape forwarding stopped by user.")
                 break
                 
-            # Forward directly to target group
-            await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved)
-            sent_count += len(batch)
+            # Pre-download files safely if the chat is restricted/protected
+            downloaded_files = []
+            if is_protected_flow:
+                for msg in batch:
+                    if msg.media:
+                        try:
+                            path = await userbot.download_media(msg.media)
+                            if path:
+                                downloaded_files.append(path)
+                        except errors.FloodWaitError as fwe:
+                            logger.warning(f"⏳ SCRAPE FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
+                            if fwe.seconds <= 5:
+                                await asyncio.sleep(fwe.seconds)
+                                try:
+                                    path = await userbot.download_media(msg.media)
+                                    if path: downloaded_files.append(path)
+                                except Exception as e2:
+                                    logger.error(f"Failed to download media after short flood wait: {e2}")
+                        except Exception as e:
+                            logger.error(f"Failed to download media for message {msg.id}: {e}")
             
-            # Vaulting / Log bots logic if enabled
-            if is_mon:
-                for m in batch:
-                    if m.media:
-                        m_type = type(m.media).__name__
-                        with db_conn() as conn:
-                            c = conn.cursor()
-                            if USING_POSTGRES:
-                                c.execute(
-                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'collection') ON CONFLICT DO NOTHING",
-                                    (pair_id, sid_resolved, m.id, m_type, m.message or "")
+            try:
+                # Forward directly to target group
+                has_media = any(msg.media for msg in batch)
+                if is_protected_flow:
+                    if has_media and not downloaded_files:
+                        logger.warning(f"🛡️ SCRAPE: Skipping mirror because media download failed/skipped.")
+                    else:
+                        await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved, pre_downloaded=downloaded_files if has_media else None)
+                else:
+                    await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved)
+                
+                sent_count += len(batch)
+                
+                # Vaulting / Log bots logic if enabled
+                if is_mon:
+                    for m in batch:
+                        if m.media:
+                            m_type = type(m.media).__name__
+                            with db_conn() as conn:
+                                c = conn.cursor()
+                                if USING_POSTGRES:
+                                    c.execute(
+                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'collection') ON CONFLICT DO NOTHING",
+                                        (pair_id, sid_resolved, m.id, m_type, m.message or "")
+                                    )
+                                else:
+                                    c.execute(
+                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'collection')",
+                                        (pair_id, sid_resolved, m.id, m_type, m.message or "")
+                                    )
+                    
+                    if is_protected_flow and downloaded_files:
+                        for token, username, bot_id in get_log_bots():
+                            metadata = f"SID: {sid_resolved} | MID: {batch[0].id}\n"
+                            caption_text = metadata + (batch[0].message or "")
+                            try:
+                                vaulted_result = await userbot.send_message(
+                                    entity=int(bot_id),
+                                    file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
+                                    message=caption_text
                                 )
-                            else:
-                                c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'collection')",
-                                    (pair_id, sid_resolved, m.id, m_type, m.message or "")
-                                )
-                # Send the entire batch to log bots (vaulting)
-                asyncio.create_task(forward_to_log_bots(userbot, batch, sid_resolved))
+                                if vaulted_result:
+                                    v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+                                    for i, v_m in enumerate(v_msgs):
+                                        orig_m = batch[i]
+                                        save_logged_media(
+                                            bot_id=int(bot_id),
+                                            log_msg_id=int(v_m.id),
+                                            source_chat_id=int(sid_resolved),
+                                            source_msg_id=int(orig_m.id),
+                                            file_id=None,
+                                            media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                                            caption=orig_m.message or "",
+                                            grouped_id=orig_m.grouped_id
+                                        )
+                            except Exception as e:
+                                logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                    elif not is_protected_flow or not has_media:
+                        asyncio.create_task(forward_to_log_bots(userbot, batch, sid_resolved))
+            finally:
+                for temp_path in downloaded_files:
+                    if os.path.exists(temp_path):
+                        try: os.remove(temp_path)
+                        except Exception: pass
                 
             # Edit status message
             l_text = f" / {limit}" if limit else ""
@@ -3146,7 +3155,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     reply_markup=markup,
                     parse_mode="Markdown"
                 )
-            except:
+            except Exception:
                 pass
                 
             await asyncio.sleep(0.5) # Flood wait safety buffer
@@ -3172,7 +3181,7 @@ async def resolve_target_id(client: TelegramClient, target_ref):
         for candidate in [int(f"-100{clean_id}"), -int(clean_id), int(clean_id)]:
             try:
                 return await client.get_entity(candidate)
-            except:
+            except Exception:
                 pass
 
     # Try finding via dialogs
@@ -3212,12 +3221,18 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
         target_chat = await resolve_target_id(userbot, sid)
         sid_resolved = target_chat.id
         
+        is_protected_flow = False
+        try:
+            is_protected_flow = getattr(target_chat, 'noforwards', False)
+        except Exception as e:
+            logger.error(f"Failed to check noforwards: {e}")
+        
         # Telethon uses iter_messages for history (newest to oldest)
         target_topic = None
         if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
             try:
                 target_topic = int(s_topic)
-            except:
+            except Exception:
                 pass
         
         collected_messages = []
@@ -3254,7 +3269,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                         reply_markup=markup,
                         parse_mode="Markdown"
                     )
-                except:
+                except Exception:
                     pass
             await asyncio.sleep(0.02)
 
@@ -3294,28 +3309,89 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 bot.send_message(admin_chat_id, f"🛑 Collection forwarding stopped by user.")
                 break
                 
-            # 1. Forward directly to target group (Normally)
-            await send_mirrored_content(userbot, tid, batch, t_topic, auto_mirror, sid_resolved)
-            sent_count += len(batch)
+            # Pre-download files safely if the chat is restricted/protected
+            downloaded_files = []
+            if is_protected_flow:
+                for msg in batch:
+                    if msg.media:
+                        try:
+                            path = await userbot.download_media(msg.media)
+                            if path:
+                                downloaded_files.append(path)
+                        except errors.FloodWaitError as fwe:
+                            logger.warning(f"⏳ COLL FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
+                            if fwe.seconds <= 5:
+                                await asyncio.sleep(fwe.seconds)
+                                try:
+                                    path = await userbot.download_media(msg.media)
+                                    if path: downloaded_files.append(path)
+                                except Exception as e2:
+                                    logger.error(f"Failed to download media after short flood wait: {e2}")
+                        except Exception as e:
+                            logger.error(f"Failed to download media for message {msg.id}: {e}")
             
-            # 2. Vaulting / Save to database
-            for m in batch:
-                m_type = get_specific_media_type(m.media)
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    if USING_POSTGRES:
-                        c.execute(
-                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pair_id, sid_resolved, m.id, m_type, m.message or "")
-                        )
+            try:
+                # Forward directly to target group
+                has_media = any(msg.media for msg in batch)
+                if is_protected_flow:
+                    if has_media and not downloaded_files:
+                        logger.warning(f"🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
                     else:
-                        c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                            (pair_id, sid_resolved, m.id, m_type, m.message or "")
-                        )
-            
-            # 3. Send to log bots (through Vault)
-            asyncio.create_task(forward_to_log_bots(userbot, batch, sid_resolved))
+                        await send_mirrored_content(userbot, tid, batch, t_topic, auto_mirror, sid_resolved, pre_downloaded=downloaded_files if has_media else None)
+                else:
+                    await send_mirrored_content(userbot, tid, batch, t_topic, auto_mirror, sid_resolved)
+                
+                sent_count += len(batch)
+                
+                # Vaulting / Save to database
+                for m in batch:
+                    m_type = get_specific_media_type(m.media)
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        if USING_POSTGRES:
+                            c.execute(
+                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                                (pair_id, sid_resolved, m.id, m_type, m.message or "")
+                            )
+                        else:
+                            c.execute(
+                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                                (pair_id, sid_resolved, m.id, m_type, m.message or "")
+                            )
+                
+                if is_protected_flow and downloaded_files:
+                    for token, username, bot_id in get_log_bots():
+                        metadata = f"SID: {sid_resolved} | MID: {batch[0].id}\n"
+                        caption_text = metadata + (batch[0].message or "")
+                        try:
+                            vaulted_result = await userbot.send_message(
+                                entity=int(bot_id),
+                                file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
+                                message=caption_text
+                            )
+                            if vaulted_result:
+                                v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+                                for i, v_m in enumerate(v_msgs):
+                                    orig_m = batch[i]
+                                    save_logged_media(
+                                        bot_id=int(bot_id),
+                                        log_msg_id=int(v_m.id),
+                                        source_chat_id=int(sid_resolved),
+                                        source_msg_id=int(orig_m.id),
+                                        file_id=None,
+                                        media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                                        caption=orig_m.message or "",
+                                        grouped_id=orig_m.grouped_id
+                                    )
+                        except Exception as e:
+                            logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                elif not is_protected_flow or not has_media:
+                    asyncio.create_task(forward_to_log_bots(userbot, batch, sid_resolved))
+            finally:
+                for temp_path in downloaded_files:
+                    if os.path.exists(temp_path):
+                        try: os.remove(temp_path)
+                        except Exception: pass
                 
             # Edit status message
             l_text = f" / {limit}" if limit else ""
@@ -3327,7 +3403,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                     reply_markup=markup,
                     parse_mode="Markdown"
                 )
-            except:
+            except Exception:
                 pass
                 
             await asyncio.sleep(0.5) # Flood wait safety buffer
@@ -3427,7 +3503,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2):
                     tgt_ent = await userbot.get_entity(real_tid)
                     if getattr(src_ent, 'forum', False) and getattr(tgt_ent, 'forum', False):
                         auto_mirror = True
-                except:
+                except Exception:
                     pass
 
                 # Handle Mirroring ID detection for release
@@ -3495,7 +3571,20 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2):
                         err_msg = str(e).lower()
                         if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"]):
                             logger.info("🛡️ RELEASE: Protected or invalid peer media detected. Attempting download & upload fallback...")
-                            local_file = await userbot.download_media(msg)
+                            local_file = None
+                            try:
+                                local_file = await userbot.download_media(msg)
+                            except errors.FloodWaitError as fwe:
+                                logger.warning(f"⏳ RELEASE FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping this item.")
+                                if fwe.seconds <= 5:
+                                    await asyncio.sleep(fwe.seconds)
+                                    try:
+                                        local_file = await userbot.download_media(msg)
+                                    except Exception as e2:
+                                        logger.error(f"Failed to download in release after short wait: {e2}")
+                            except Exception as de:
+                                logger.error(f"Failed to download media in release: {de}")
+                            
                             if local_file:
                                 try:
                                     sent_msg = await userbot.send_message(
@@ -3553,7 +3642,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2):
                 sent += 1
                 if sent % 5 == 0:
                     try: bot.edit_message_text(f"🚀 Releasing `{s_title}` ({category_name})...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
-                    except: pass
+                    except Exception: pass
                 await asyncio.sleep(interval)
             except Exception as e:
                 logger.error(f"Release error: {e}")
@@ -3584,7 +3673,7 @@ async def userbot_watchdog():
                 if "deactivated" in err_msg or "authorized" in err_msg or "simultaneous" in err_msg or "ip address" in err_msg:
                     logger.warning(f"WATCHDOG: Userbot session invalid or conflict: {e}")
                     try: await userbot.disconnect()
-                    except: pass
+                    except Exception: pass
                     userbot = None
                     
                     # Clear session from DB to force re-login
@@ -3716,7 +3805,7 @@ class LogBotManager:
                     logger.info(f"🚀 Log Bot @{bot_info.username} started polling.")
                     new_bot.delete_webhook(drop_pending_updates=True)
                     # Use a shorter timeout and skip pending to reduce conflict duration
-                    new_bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+                    new_bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20, threaded=False)
                 except Exception as e:
                     if "Conflict" in str(e):
                         logger.warning(f"⚠️ Log Bot @{bot_info.username} conflict. Retrying in 15s...")
@@ -4129,7 +4218,7 @@ async def main():
                 logger.info("🚀 Starting Admin Bot polling...")
                 bot.delete_webhook(drop_pending_updates=True)
                 # Reduced timeout and conflict handling
-                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20, threaded=False)
             except Exception as e:
                 if "Conflict" in str(e):
                     logger.warning("⚠️ Main Admin Bot conflict. Retrying in 20s...")

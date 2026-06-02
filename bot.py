@@ -1,5 +1,6 @@
 #gimini
 import os
+from collections import deque
 import asyncio
 import threading
 import logging
@@ -91,6 +92,10 @@ USING_POSTGRES = False
 # Album Cache for grouping media
 # {grouped_id: [message_objects]}
 album_cache = {}
+
+# Deduplication cache for incoming message events
+processed_messages = set()
+processed_messages_queue = deque(maxlen=2000)
 
 def get_placeholder(conn=None):
     if DATABASE_URL and USING_POSTGRES:
@@ -1566,9 +1571,28 @@ def setup_automation_handlers(client: TelegramClient):
         m = event.message
         if not m: return
 
+        # Ensure client._me is cached
+        if not hasattr(client, '_me') or not client._me:
+            try:
+                client._me = await client.get_me()
+            except Exception as e:
+                logger.error(f"Failed to get_me() for userbot: {e}")
+
         # Ignore all outgoing messages sent by the userbot itself to prevent loops and media leakage
-        if m.out:
+        me = getattr(client, '_me', None)
+        if m.out or (me and m.sender_id == me.id):
             return
+
+        # Deduplicate message events to prevent duplicate processing
+        msg_key = (m.chat_id, m.id)
+        if msg_key in processed_messages:
+            logger.info(f"🔄 Ignore duplicate event for message {m.id} in chat {m.chat_id}")
+            return
+        processed_messages.add(msg_key)
+        processed_messages_queue.append(msg_key)
+        if len(processed_messages) > 2000:
+            processed_messages.clear()
+            processed_messages.update(processed_messages_queue)
 
         # --- BAN LIST CHECK ---
         sender_id = m.sender_id

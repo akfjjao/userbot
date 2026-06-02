@@ -2550,6 +2550,124 @@ def cmd_logout(message):
     markup.add(InlineKeyboardButton("❌ Cancel", callback_data="dash_main"))
     bot.send_message(message.chat.id, "⚠️ *Logout Confirmation*\n\nThis will stop the userbot and delete the session from the database. Are you sure?", reply_markup=markup, parse_mode="Markdown")
 
+@bot.message_handler(commands=['addmanager'])
+def cmd_add_manager(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "💡 *Usage:* `/addmanager [username_or_id]`", parse_mode="Markdown")
+        return
+    
+    target_user = args[1]
+    status_msg = bot.send_message(message.chat.id, "⏳ Resolving manager user...")
+    
+    async def do_add():
+        try:
+            is_ok, msg = await ensure_userbot()
+            if not is_ok:
+                bot.edit_message_text(f"❌ Userbot error: {msg}", message.chat.id, status_msg.message_id)
+                return
+            
+            user_entity = await userbot.get_entity(target_user)
+            uid = user_entity.id
+            uname = getattr(user_entity, 'username', None) or ""
+            
+            with db_conn() as conn:
+                c = conn.cursor()
+                p = get_placeholder()
+                if USING_POSTGRES:
+                    c.execute("INSERT INTO managers (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", (uid, uname))
+                else:
+                    c.execute("INSERT OR REPLACE INTO managers (user_id, username) VALUES (?, ?)", (uid, uname))
+            
+            bot.edit_message_text(
+                f"✅ *Manager Authorized!*\n\n**User ID:** `{uid}`\n**Username:** `@{uname}`" if uname else f"✅ *Manager Authorized!*\n\n**User ID:** `{uid}`",
+                message.chat.id,
+                status_msg.message_id,
+                parse_mode="Markdown"
+            )
+            
+            # Send welcome DM to the new manager from the userbot!
+            welcome_msg = (
+                "🎉 **Congratulations! You have been authorized as a Manager!**\n\n"
+                "You can now configure target pairs and instruct the userbot to join groups directly through this chat!\n\n"
+                "🛠️ **Available Commands:**\n"
+                "• `.join <link_or_username>`: Request the userbot to join a group or channel.\n"
+                "• `.pair <source> <target>` (or `.addpair`): Link a source chat to a target chat for live forwarding.\n"
+                "• `.delpair <pair_id>`: Delete a target pair.\n"
+                "• `.pairs` (or `.listpairs`): List all active target pairs.\n"
+                "• `.setpair <pair_id> <live/mon/mir> <1/0>`: Turn settings on (1) or off (0).\n\n"
+                "💬 **Group Joining Wizard:**\n"
+                "Simply send any Telegram group link or username (e.g. `t.me/cctest` or `@cctest`) to this chat, and I will automatically guide you on how to join and configure it!"
+            )
+            try:
+                await userbot.send_message(user_entity, welcome_msg)
+            except Exception as welcome_err:
+                logger.error(f"Failed to send welcome message to new manager {uid}: {welcome_err}")
+                
+        except Exception as e:
+            bot.edit_message_text(f"❌ Failed to authorize manager: {e}", message.chat.id, status_msg.message_id)
+    
+    asyncio.run_coroutine_threadsafe(do_add(), loop)
+
+@bot.message_handler(commands=['delmanager'])
+def cmd_del_manager(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "💡 *Usage:* `/delmanager [username_or_id]`", parse_mode="Markdown")
+        return
+    
+    target_user = args[1]
+    status_msg = bot.send_message(message.chat.id, "⏳ Resolving manager user...")
+    
+    async def do_del():
+        try:
+            if target_user.lstrip("-").isdigit():
+                uid = int(target_user)
+            else:
+                is_ok, msg = await ensure_userbot()
+                if not is_ok:
+                    bot.edit_message_text(f"❌ Userbot error: {msg}", message.chat.id, status_msg.message_id)
+                    return
+                user_entity = await userbot.get_entity(target_user)
+                uid = user_entity.id
+            
+            with db_conn() as conn:
+                c = conn.cursor()
+                p = get_placeholder()
+                c.execute(f"DELETE FROM managers WHERE user_id = {p}", (uid,))
+            
+            bot.edit_message_text(f"✅ *Manager Revoked!*\n\n**User ID:** `{uid}`", message.chat.id, status_msg.message_id, parse_mode="Markdown")
+        except Exception as e:
+            bot.edit_message_text(f"❌ Failed to revoke manager: {e}", message.chat.id, status_msg.message_id)
+    
+    asyncio.run_coroutine_threadsafe(do_del(), loop)
+
+@bot.message_handler(commands=['managers'])
+def cmd_list_managers(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute("SELECT user_id, username FROM managers ORDER BY user_id ASC")
+            rows = c.fetchall()
+        
+        if not rows:
+            bot.send_message(message.chat.id, "📭 *No additional managers authorized.*", parse_mode="Markdown")
+            return
+        
+        text_lines = ["📋 *Authorized Managers:*\n"]
+        for uid, uname in rows:
+            text_lines.append(f"👤 `{uid}`" + (f" (@{uname})" if uname else ""))
+        
+        bot.send_message(message.chat.id, "\n".join(text_lines), parse_mode="Markdown")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Error fetching managers: {e}")
+
 def parse_telegram_link(text):
     import re
     text = text.strip()

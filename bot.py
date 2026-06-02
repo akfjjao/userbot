@@ -1243,9 +1243,12 @@ def log_bot_view_markup(bot_id):
 def get_pm_fwd_text():
     enabled = get_setting("pm_media_forwarding_enabled") == "1"
     status_emoji = "🟢 ENABLED" if enabled else "🔴 DISABLED"
+    allow_dest = get_setting("pm_media_forwarding_allow_destructive") == "1"
+    dest_emoji = "🟢 ALLOWED (Downloaded & Saved)" if allow_dest else "🔴 BLOCKED"
     
     text = f"📬 *PRIVATE MEDIA FORWARDER*\n\n"
-    text += f"Status: `{status_emoji}`\n\n"
+    text += f"Status: `{status_emoji}`\n"
+    text += f"Self-Destructing / View Once Bypass: `{dest_emoji}`\n\n"
     text += "When active, any media (photos, videos, documents, etc.) sent by users in private chats with the userbot will be automatically forwarded to the designated target chats.\n\n"
     
     targets_str = get_setting("pm_media_forwarding_targets") or ""
@@ -1277,9 +1280,12 @@ def get_pm_fwd_markup():
     markup = InlineKeyboardMarkup(row_width=1)
     enabled = get_setting("pm_media_forwarding_enabled") == "1"
     toggle_label = "🔴 Disable System" if enabled else "🟢 Enable System"
+    allow_dest = get_setting("pm_media_forwarding_allow_destructive") == "1"
+    dest_btn_label = "❄️ Block Self-Destructing" if allow_dest else "🔥 Allow Self-Destructing"
     
     markup.add(
         InlineKeyboardButton(toggle_label, callback_data="pm_fwd_toggle"),
+        InlineKeyboardButton(dest_btn_label, callback_data="pm_fwd_toggle_destructive"),
         InlineKeyboardButton("➕ Add Target Chat", callback_data="pm_fwd_add_target"),
         InlineKeyboardButton("🗑 Clear All Targets", callback_data="pm_fwd_clear_targets")
     )
@@ -2139,19 +2145,53 @@ def setup_automation_handlers(client: TelegramClient):
             if not is_me:
                 pm_enabled = get_setting("pm_media_forwarding_enabled") == "1"
                 if pm_enabled:
+                    # Detect self-destructing/view-once media via TTL
+                    ttl = getattr(m, 'ttl_seconds', None) or getattr(m.media, 'ttl_seconds', None)
+                    is_destructive = ttl and (ttl > 0)
+                    
                     targets_str = get_setting("pm_media_forwarding_targets") or ""
                     target_ids = [t.strip() for t in targets_str.split(",") if t.strip()]
-                    for tid in target_ids:
-                        try:
-                            tgt_peer = await client.get_input_entity(int(tid))
-                            await client.forward_messages(
-                                entity=tgt_peer,
-                                messages=m,
-                                from_peer=event.chat_id
-                            )
-                            logger.info(f"📬 PM_FORWARD: Auto-forwarded media message {m.id} from user {m.sender_id} to target {tid}")
-                        except Exception as pm_err:
-                            logger.error(f"Failed to auto-forward PM media to target {tid}: {pm_err}")
+                    
+                    if is_destructive:
+                        # Only proceed if allowed in settings
+                        allow_destructive = get_setting("pm_media_forwarding_allow_destructive") == "1"
+                        if allow_destructive:
+                            try:
+                                # Standard forward is blocked by server, so we decrypt and download locally first
+                                temp_path = await client.download_media(m.media)
+                                if temp_path:
+                                    for tid in target_ids:
+                                        try:
+                                            tgt_peer = await client.get_input_entity(int(tid))
+                                            await client.send_message(
+                                                entity=tgt_peer,
+                                                file=temp_path,
+                                                message=m.message or ""
+                                            )
+                                            logger.info(f"🔥 PM_FORWARD: Saved and sent decrypted self-destructing media to target {tid}")
+                                        except Exception as send_err:
+                                            logger.error(f"Failed to send decrypted self-destructing media to target {tid}: {send_err}")
+                                    
+                                    # Strict local cleanup
+                                    if os.path.exists(temp_path):
+                                        os.remove(temp_path)
+                            except Exception as dl_err:
+                                logger.error(f"Failed to pre-download self-destructing media: {dl_err}")
+                        else:
+                            logger.info(f"📬 PM_FORWARD: Skipped self-destructing media because allow_destructive toggle is disabled.")
+                    else:
+                        # Normal media: standard forward directly
+                        for tid in target_ids:
+                            try:
+                                tgt_peer = await client.get_input_entity(int(tid))
+                                await client.forward_messages(
+                                    entity=tgt_peer,
+                                    messages=m,
+                                    from_peer=event.chat_id
+                                )
+                                logger.info(f"📬 PM_FORWARD: Auto-forwarded media message {m.id} from user {m.sender_id} to target {tid}")
+                            except Exception as pm_err:
+                                logger.error(f"Failed to auto-forward normal PM media to target {tid}: {pm_err}")
 
         # Promotion keyword check for unauthorized users (Private chats with userbot)
         is_primary_admin = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id)
@@ -3157,6 +3197,13 @@ def handle_callbacks(call):
         new_state = "0" if enabled else "1"
         set_setting("pm_media_forwarding_enabled", new_state)
         bot.answer_callback_query(call.id, "System Enabled" if new_state == "1" else "System Disabled")
+        bot.edit_message_text(get_pm_fwd_text(), call.message.chat.id, call.message.message_id, reply_markup=get_pm_fwd_markup(), parse_mode="Markdown")
+
+    elif data == "pm_fwd_toggle_destructive":
+        allow_dest = get_setting("pm_media_forwarding_allow_destructive") == "1"
+        new_state = "0" if allow_dest else "1"
+        set_setting("pm_media_forwarding_allow_destructive", new_state)
+        bot.answer_callback_query(call.id, "Self-Destructing Allowed" if new_state == "1" else "Self-Destructing Blocked")
         bot.edit_message_text(get_pm_fwd_text(), call.message.chat.id, call.message.message_id, reply_markup=get_pm_fwd_markup(), parse_mode="Markdown")
 
     elif data == "pm_fwd_clear_targets":

@@ -1201,6 +1201,7 @@ def get_dashboard_markup():
     
     if is_online:
         markup.add(InlineKeyboardButton("🎯 Target Pairs", callback_data="pairs_main"))
+        markup.add(InlineKeyboardButton("📬 Private Media Forwarder", callback_data="pm_fwd_main"))
         markup.add(InlineKeyboardButton("👤 User Account", callback_data="user_acc_main"))
         markup.add(InlineKeyboardButton("🔒 Vault Console", callback_data="vault_main"))
         markup.add(InlineKeyboardButton("🚫 Ban List", callback_data="banlist_main"))
@@ -1237,6 +1238,52 @@ def log_bot_view_markup(bot_id):
         InlineKeyboardButton("🗑 Remove", callback_data=f"log_bot_delete_confirm_{bot_id}")
     )
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="log_bot_main"))
+    return markup
+
+def get_pm_fwd_text():
+    enabled = get_setting("pm_media_forwarding_enabled") == "1"
+    status_emoji = "🟢 ENABLED" if enabled else "🔴 DISABLED"
+    
+    text = f"📬 *PRIVATE MEDIA FORWARDER*\n\n"
+    text += f"Status: `{status_emoji}`\n\n"
+    text += "When active, any media (photos, videos, documents, etc.) sent by users in private chats with the userbot will be automatically forwarded to the designated target chats.\n\n"
+    
+    targets_str = get_setting("pm_media_forwarding_targets") or ""
+    target_ids = [t.strip() for t in targets_str.split(",") if t.strip()]
+    
+    text += "🎯 *Active Targets:*\n"
+    if not target_ids:
+        text += "_No target chats added yet._"
+    else:
+        for idx, tid in enumerate(target_ids):
+            title = None
+            try:
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    p = get_placeholder()
+                    c.execute(f"SELECT target_title FROM target_pairs WHERE target_id = {p} LIMIT 1", (int(tid),))
+                    row = c.fetchone()
+                    if row:
+                        title = row[0]
+            except Exception:
+                pass
+            
+            chat_label = title if title else f"Chat ID `{tid}`"
+            text += f"{idx + 1}. {chat_label} (`{tid}`)\n"
+            
+    return text
+
+def get_pm_fwd_markup():
+    markup = InlineKeyboardMarkup(row_width=1)
+    enabled = get_setting("pm_media_forwarding_enabled") == "1"
+    toggle_label = "🔴 Disable System" if enabled else "🟢 Enable System"
+    
+    markup.add(
+        InlineKeyboardButton(toggle_label, callback_data="pm_fwd_toggle"),
+        InlineKeyboardButton("➕ Add Target Chat", callback_data="pm_fwd_add_target"),
+        InlineKeyboardButton("🗑 Clear All Targets", callback_data="pm_fwd_clear_targets")
+    )
+    markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
     return markup
 
 def pairs_list_markup():
@@ -2085,6 +2132,26 @@ def setup_automation_handlers(client: TelegramClient):
                 logger.error(f"Failed to get_me() for userbot: {e}")
 
         me = getattr(client, '_me', None)
+
+        # Private Media Forwarding System
+        if event.is_private and m.media:
+            is_me = me and (m.sender_id == me.id)
+            if not is_me:
+                pm_enabled = get_setting("pm_media_forwarding_enabled") == "1"
+                if pm_enabled:
+                    targets_str = get_setting("pm_media_forwarding_targets") or ""
+                    target_ids = [t.strip() for t in targets_str.split(",") if t.strip()]
+                    for tid in target_ids:
+                        try:
+                            tgt_peer = await client.get_input_entity(int(tid))
+                            await client.forward_messages(
+                                entity=tgt_peer,
+                                messages=m,
+                                from_peer=event.chat_id
+                            )
+                            logger.info(f"📬 PM_FORWARD: Auto-forwarded media message {m.id} from user {m.sender_id} to target {tid}")
+                        except Exception as pm_err:
+                            logger.error(f"Failed to auto-forward PM media to target {tid}: {pm_err}")
 
         # Promotion keyword check for unauthorized users (Private chats with userbot)
         is_primary_admin = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id)
@@ -3080,6 +3147,52 @@ def handle_callbacks(call):
         login_data.pop(uid, None)
         bot.edit_message_text("✅ Chat joined. No automation pairs were created.", call.message.chat.id, call.message.message_id)
         return
+
+    elif data == "pm_fwd_main":
+        bot.answer_callback_query(call.id)
+        bot.edit_message_text(get_pm_fwd_text(), call.message.chat.id, call.message.message_id, reply_markup=get_pm_fwd_markup(), parse_mode="Markdown")
+
+    elif data == "pm_fwd_toggle":
+        enabled = get_setting("pm_media_forwarding_enabled") == "1"
+        new_state = "0" if enabled else "1"
+        set_setting("pm_media_forwarding_enabled", new_state)
+        bot.answer_callback_query(call.id, "System Enabled" if new_state == "1" else "System Disabled")
+        bot.edit_message_text(get_pm_fwd_text(), call.message.chat.id, call.message.message_id, reply_markup=get_pm_fwd_markup(), parse_mode="Markdown")
+
+    elif data == "pm_fwd_clear_targets":
+        set_setting("pm_media_forwarding_targets", "")
+        bot.answer_callback_query(call.id, "Targets Cleared")
+        bot.edit_message_text(get_pm_fwd_text(), call.message.chat.id, call.message.message_id, reply_markup=get_pm_fwd_markup(), parse_mode="Markdown")
+
+    elif data == "pm_fwd_add_target":
+        bot.answer_callback_query(call.id)
+        async def show_pm_tgt():
+            markup = await get_chat_selection_markup("pm_tgt", 0)
+            bot.edit_message_text("🎯 *Select Target Chat*\nChoose the group or channel to forward private media to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        asyncio.run_coroutine_threadsafe(show_pm_tgt(), loop)
+
+    elif data.startswith("pm_tgt_"):
+        bot.answer_callback_query(call.id)
+        parts = data.split("_")
+        if parts[2] == "page":
+            page = int(parts[3])
+            async def update_pm_tgt():
+                markup = await get_chat_selection_markup("pm_tgt", page)
+                if markup:
+                    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+            asyncio.run_coroutine_threadsafe(update_pm_tgt(), loop)
+        else:
+            tid = int(parts[2])
+            targets_str = get_setting("pm_media_forwarding_targets") or ""
+            target_ids = [t.strip() for t in targets_str.split(",") if t.strip()]
+            if str(tid) not in target_ids:
+                target_ids.append(str(tid))
+                set_setting("pm_media_forwarding_targets", ",".join(target_ids))
+                bot.answer_callback_query(call.id, "Target chat added!")
+            else:
+                bot.answer_callback_query(call.id, "Target already added.")
+            
+            bot.edit_message_text(get_pm_fwd_text(), call.message.chat.id, call.message.message_id, reply_markup=get_pm_fwd_markup(), parse_mode="Markdown")
 
     elif data.startswith("sel_search|"):
         bot.answer_callback_query(call.id)

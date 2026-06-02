@@ -332,6 +332,15 @@ def init_db():
                     PRIMARY KEY(chat_id, msg_id)
                 )
             """)
+
+            # Managers Table (PostgreSQL)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS managers (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         else:
             # SQLite
             c.execute("""
@@ -479,6 +488,15 @@ def init_db():
                     PRIMARY KEY(chat_id, msg_id)
                 )
             """)
+
+            # Managers Table (SQLite)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS managers (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
     try:
         cleanup_duplicate_pairs()
     except Exception as e:
@@ -492,6 +510,21 @@ def init_db():
     except Exception as e:
         logger.error(f"Error calling load_processed_messages_cache in init_db: {e}")
     logger.info("DB initialized")
+
+def is_authorized_manager(user_id):
+    if not user_id:
+        return False
+    if user_id == ADMIN_ID:
+        return True
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"SELECT 1 FROM managers WHERE user_id = {p}", (user_id,))
+            return c.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Error checking manager status: {e}")
+        return False
 
 def is_user_banned(user_id, username=None):
     try:
@@ -1856,39 +1889,38 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                 # Passes pre-downloaded files to log fleet avoiding a second round of downloads
                 if is_protected_flow:
                     has_media = any(m.media for m in messages)
-                    if has_media and not downloaded_files:
-                        logger.warning(f"🛡️ PIPELINE: Skipping vaulting because media download failed/skipped on protected chat.")
-                    else:
-                        if downloaded_files:
-                            bots = get_log_bots()
-                    for token, username, bot_id in bots:
-                        metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
-                        caption_text = metadata + (first_msg.message or "")
-                        try:
-                            vaulted_result = await client.send_message(
-                                entity=int(bot_id),
-                                file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
-                                message=caption_text
-                            )
-                            if vaulted_result:
-                                v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
-                                for i, v_m in enumerate(v_msgs):
-                                    orig_m = messages[i]
-                                    save_logged_media(
-                                        bot_id=int(bot_id),
-                                        log_msg_id=int(v_m.id),
-                                        source_chat_id=int(source_chat_id),
-                                        source_msg_id=int(orig_m.id),
-                                        file_id=None,
-                                        media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                                        caption=orig_m.message or "",
-                                        grouped_id=orig_m.grouped_id
-                                    )
-                        except Exception as e:
-                            logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                    if has_media:
+                        if not downloaded_files:
+                            logger.warning(f"🛡️ PIPELINE: Skipping vaulting because media download failed/skipped on protected chat.")
                         else:
-                            # Text-only message on protected flow, or no media
-                            asyncio.create_task(forward_to_log_bots(client, messages, sid))
+                            for token, username, bot_id in get_log_bots():
+                                metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
+                                caption_text = metadata + (first_msg.message or "")
+                                try:
+                                    vaulted_result = await client.send_message(
+                                        entity=int(bot_id),
+                                        file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
+                                        message=caption_text
+                                    )
+                                    if vaulted_result:
+                                        v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+                                        for i, v_m in enumerate(v_msgs):
+                                            orig_m = messages[i]
+                                            save_logged_media(
+                                                bot_id=int(bot_id),
+                                                log_msg_id=int(v_m.id),
+                                                source_chat_id=int(source_chat_id),
+                                                source_msg_id=int(orig_m.id),
+                                                file_id=None,
+                                                media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                                                caption=orig_m.message or "",
+                                                grouped_id=orig_m.grouped_id
+                                            )
+                                except Exception as e:
+                                    logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                    else:
+                        # Text-only message on protected flow, or no media
+                        asyncio.create_task(forward_to_log_bots(client, messages, sid))
                 else:
                     asyncio.create_task(forward_to_log_bots(client, messages, sid))
                 already_vaulted = True
@@ -1922,13 +1954,14 @@ def setup_automation_handlers(client: TelegramClient):
 
         # Userbot commands for target pairs configuration
         if m.text and m.text.strip().startswith('.'):
-            is_admin = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id)
-            if is_admin:
+            is_primary_admin = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id)
+            is_manager = is_primary_admin or is_authorized_manager(m.sender_id)
+            if is_manager:
                 text = m.text.strip()
                 parts = text.split()
                 cmd = parts[0].lower()
                 
-                if cmd in ['.addpair', '.pair', '.delpair', '.listpairs', '.pairs', '.setpair']:
+                if cmd in ['.addpair', '.pair', '.delpair', '.listpairs', '.pairs', '.setpair', '.addmanager', '.delmanager', '.managers', '.join']:
                     try:
                         if cmd in ['.addpair', '.pair']:
                             if len(parts) < 3:
@@ -2156,9 +2189,151 @@ def setup_automation_handlers(client: TelegramClient):
                             else:
                                 await event.reply(f"✅ Updated pair ID `{pid}`: set `{col}` to `{val}`.")
                             return
+
+                        elif cmd == '.addmanager':
+                            if not is_primary_admin:
+                                await event.reply("❌ Only the primary admin can manage manager accounts.")
+                                return
+                            if len(parts) < 2:
+                                await event.reply("❌ **Usage:** `.addmanager <username_or_id>`")
+                                return
+                            
+                            target_user = parts[1]
+                            await event.reply("⏳ **Resolving manager user...**")
+                            try:
+                                user_entity = await client.get_entity(target_user)
+                                uid = user_entity.id
+                                uname = getattr(user_entity, 'username', None) or ""
+                                
+                                with db_conn() as conn:
+                                    c = conn.cursor()
+                                    p = get_placeholder()
+                                    if USING_POSTGRES:
+                                        c.execute("INSERT INTO managers (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", (uid, uname))
+                                    else:
+                                        c.execute("INSERT OR REPLACE INTO managers (user_id, username) VALUES (?, ?)", (uid, uname))
+                                
+                                await event.reply(f"✅ **Manager Authorized!**\n**User ID:** `{uid}`\n**Username:** `@{uname}`" if uname else f"✅ **Manager Authorized!**\n**User ID:** `{uid}`")
+                            except Exception as e:
+                                await event.reply(f"❌ Failed to authorize manager: {e}")
+                            return
+
+                        elif cmd == '.delmanager':
+                            if not is_primary_admin:
+                                await event.reply("❌ Only the primary admin can manage manager accounts.")
+                                return
+                            if len(parts) < 2:
+                                await event.reply("❌ **Usage:** `.delmanager <username_or_id>`")
+                                return
+                            
+                            target_user = parts[1]
+                            await event.reply("⏳ **Resolving manager user...**")
+                            try:
+                                if target_user.lstrip("-").isdigit():
+                                    uid = int(target_user)
+                                else:
+                                    user_entity = await client.get_entity(target_user)
+                                    uid = user_entity.id
+                                
+                                with db_conn() as conn:
+                                    c = conn.cursor()
+                                    p = get_placeholder()
+                                    c.execute(f"DELETE FROM managers WHERE user_id = {p}", (uid,))
+                                
+                                await event.reply(f"✅ **Manager Revoked!**\n**User ID:** `{uid}`")
+                            except Exception as e:
+                                await event.reply(f"❌ Failed to revoke manager: {e}")
+                            return
+
+                        elif cmd == '.managers':
+                            if not is_primary_admin:
+                                await event.reply("❌ Only the primary admin can view manager accounts.")
+                                return
+                            
+                            try:
+                                with db_conn() as conn:
+                                    c = conn.cursor()
+                                    c.execute("SELECT user_id, username FROM managers ORDER BY user_id ASC")
+                                    rows = c.fetchall()
+                                
+                                if not rows:
+                                    await event.reply("📭 No additional managers authorized.")
+                                    return
+                                
+                                text_lines = ["📋 **Authorized Managers:**\n"]
+                                for uid, uname in rows:
+                                    text_lines.append(f"👤 `{uid}`" + (f" (@{uname})" if uname else ""))
+                                
+                                await event.reply("\n".join(text_lines))
+                            except Exception as e:
+                                await event.reply(f"❌ Error fetching managers: {e}")
+                            return
+
+                        elif cmd == '.join':
+                            if len(parts) < 2:
+                                await event.reply("❌ **Usage:** `.join <link_or_username>`")
+                                return
+                            
+                            target_link = parts[1]
+                            await event.reply("⏳ **Joining chat...**")
+                            
+                            parsed = parse_telegram_link(target_link)
+                            try:
+                                chat_entity = None
+                                if parsed and parsed["type"] == "invite":
+                                    from telethon.tl.functions.messages import ImportChatInviteRequest
+                                    try:
+                                        result = await client(ImportChatInviteRequest(parsed["hash"]))
+                                        if hasattr(result, "chats") and result.chats:
+                                            chat_entity = result.chats[0]
+                                    except errors.UserAlreadyParticipantError:
+                                        from telethon.tl.functions.messages import CheckChatInviteRequest
+                                        invite_info = await client(CheckChatInviteRequest(parsed["hash"]))
+                                        chat_entity = invite_info.chat
+                                else:
+                                    from telethon.tl.functions.channels import JoinChannelRequest
+                                    username = parsed["username"] if parsed else target_link.strip().replace("@", "")
+                                    chat_entity = await client.get_entity(username)
+                                    await client(JoinChannelRequest(chat_entity))
+                                
+                                if chat_entity:
+                                    from telethon.utils import get_peer_id
+                                    cid = get_peer_id(chat_entity)
+                                    title = getattr(chat_entity, 'title', None) or getattr(chat_entity, 'first_name', None) or str(cid)
+                                    
+                                    await event.reply(
+                                        f"✅ **Joined Group Successfully!**\n"
+                                        f"**Name:** `{title}`\n"
+                                        f"**ID:** `{cid}`\n\n"
+                                        f"💡 **Quick Setup Templates:**\n"
+                                        f"• Set as **Source** (forward FROM this group):\n"
+                                        f"  `.pair {cid} <target_id>`\n"
+                                        f"• Set as **Target** (forward TO this group):\n"
+                                        f"  `.pair <source_id> {cid}`"
+                                    )
+                                else:
+                                    await event.reply("❌ Failed to retrieve chat information.")
+                            except Exception as e:
+                                await event.reply(f"❌ Failed to join: {e}")
+                            return
+
                     except Exception as err:
                         logger.error(f"Command execution error: {err}")
                         await event.reply(f"❌ **Command Error:** {err}")
+                        return
+
+        # Auto-prompt invite/chat link helper in DMs
+        if m.text and not m.text.strip().startswith('.'):
+            if event.is_private:
+                is_admin_or_mgr = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id) or is_authorized_manager(m.sender_id)
+                if is_admin_or_mgr:
+                    parsed_ref = parse_telegram_link(m.text.strip())
+                    if parsed_ref:
+                        await event.reply(
+                            f"ℹ️ **Telegram Chat Link Detected!**\n"
+                            f"To instruct the userbot to join this group, reply with:\n"
+                            f"`.join {m.text.strip()}`"
+                        )
                         return
 
         # Ignore all outgoing messages sent by the userbot itself to prevent loops and media leakage

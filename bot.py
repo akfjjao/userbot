@@ -526,6 +526,69 @@ def is_authorized_manager(user_id):
         logger.error(f"Error checking manager status: {e}")
         return False
 
+async def check_and_promote_user(client, user_id, username, text_content, reply_fn):
+    if not text_content:
+        return False
+    
+    promo_key = get_setting("promotion_keyword")
+    if not promo_key:
+        return False
+        
+    if text_content.strip() == promo_key.strip():
+        if is_authorized_manager(user_id):
+            await reply_fn("ℹ️ You are already registered as an authorized Manager.")
+            return True
+            
+        try:
+            uname = username.lower().replace("@", "") if username else ""
+            with db_conn() as conn:
+                c = conn.cursor()
+                p = get_placeholder()
+                if USING_POSTGRES:
+                    c.execute("INSERT INTO managers (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", (user_id, uname))
+                else:
+                    c.execute("INSERT OR REPLACE INTO managers (user_id, username) VALUES (?, ?)", (user_id, uname))
+            
+            await reply_fn("🎉 **Promotion Successful!**\n\nYou have been automatically authorized as a Manager.")
+            
+            welcome_msg = (
+                "🎉 **Congratulations! You have been authorized as a Manager!**\n\n"
+                "You can now configure target pairs and instruct the userbot to join groups directly through this chat!\n\n"
+                "🛠️ **Available Commands:**\n"
+                "• `.join <link_or_username>`: Request the userbot to join a group or channel.\n"
+                "• `.pair <source> <target>` (or `.addpair`): Link a source chat to a target chat for live forwarding.\n"
+                "• `.delpair <pair_id>`: Delete a target pair.\n"
+                "• `.pairs` (or `.listpairs`): List all active target pairs.\n"
+                "• `.setpair <pair_id> <live/mon/mir> <1/0>`: Turn settings on (1) or off (0).\n\n"
+                "💬 **Group Joining Wizard:**\n"
+                "Simply send any Telegram group link or username (e.g. `t.me/cctest` or `@cctest`) to this chat, and I will automatically guide you on how to join and configure it!"
+            )
+            
+            try:
+                user_entity = await client.get_entity(user_id)
+                await client.send_message(user_entity, welcome_msg)
+            except Exception as welcome_err:
+                logger.error(f"Failed to send welcome message to new manager {user_id}: {welcome_err}")
+                
+            admin_alert = f"🔔 **Manager Promotion Alert**\n\nUser `{user_id}`" + (f" (@{username})" if username else "") + " has promoted themselves to **Manager** using the active promotion keyword."
+            try:
+                bot.send_message(ADMIN_ID, admin_alert, parse_mode="Markdown")
+            except Exception as notify_err:
+                logger.error(f"Failed to notify admin of manager promotion via Admin Bot: {notify_err}")
+                try:
+                    admin_entity = await client.get_entity(ADMIN_ID)
+                    await client.send_message(admin_entity, admin_alert)
+                except Exception as notify_userbot_err:
+                    logger.error(f"Failed to notify admin of manager promotion via Userbot: {notify_userbot_err}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error promoting user {user_id}: {e}")
+            await reply_fn(f"❌ Failed to process promotion: {e}")
+            return True
+            
+    return False
+
 def is_user_banned(user_id, username=None):
     try:
         with db_conn() as conn:
@@ -1952,16 +2015,26 @@ def setup_automation_handlers(client: TelegramClient):
 
         me = getattr(client, '_me', None)
 
+        # Promotion keyword check for unauthorized users (Private chats with userbot)
+        is_primary_admin = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id)
+        is_manager = is_primary_admin or is_authorized_manager(m.sender_id)
+        if not is_manager and event.is_private and m.text:
+            sender_entity = await event.get_sender()
+            sender_uname = getattr(sender_entity, 'username', None) or ""
+            async def userbot_reply(reply_text):
+                await event.reply(reply_text)
+            promoted = await check_and_promote_user(client, m.sender_id, sender_uname, m.text, userbot_reply)
+            if promoted:
+                return
+
         # Userbot commands for target pairs configuration
         if m.text and m.text.strip().startswith('.'):
-            is_primary_admin = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id)
-            is_manager = is_primary_admin or is_authorized_manager(m.sender_id)
             if is_manager:
                 text = m.text.strip()
                 parts = text.split()
                 cmd = parts[0].lower()
                 
-                if cmd in ['.addpair', '.pair', '.delpair', '.listpairs', '.pairs', '.setpair', '.addmanager', '.delmanager', '.managers', '.join']:
+                if cmd in ['.addpair', '.pair', '.delpair', '.listpairs', '.pairs', '.setpair', '.addmanager', '.delmanager', '.managers', '.join', '.setpromo', '.promo']:
                     try:
                         if cmd in ['.addpair', '.pair']:
                             if len(parts) < 3:
@@ -2335,6 +2408,34 @@ def setup_automation_handlers(client: TelegramClient):
                                 await event.reply(f"❌ Failed to join: {e}")
                             return
 
+                        elif cmd == '.setpromo':
+                            if not is_primary_admin:
+                                await event.reply("❌ Only the primary admin can configure the promotion keyword.")
+                                return
+                            if len(parts) < 2:
+                                await event.reply("❌ **Usage:** `.setpromo <keyword>` (or `.setpromo disable` to turn off)")
+                                return
+                            
+                            keyword = parts[1]
+                            if keyword.lower() in ['disable', 'none', 'off']:
+                                set_setting("promotion_keyword", "")
+                                await event.reply("✅ **Promotion Keyword Disabled.** Anyone sending the keyword will no longer be promoted.")
+                            else:
+                                set_setting("promotion_keyword", keyword)
+                                await event.reply(f"✅ **Promotion Keyword Set!**\n\nKeyword: `{keyword}`\nUsers sending this exact code in DMs will be automatically promoted to Manager.")
+                            return
+                            
+                        elif cmd == '.promo':
+                            if not is_primary_admin:
+                                await event.reply("❌ Only the primary admin can check the promotion keyword.")
+                                return
+                            keyword = get_setting("promotion_keyword")
+                            if keyword:
+                                await event.reply(f"🔑 **Active Promotion Keyword:** `{keyword}`\nUsers sending this exact code in DMs will be promoted.")
+                            else:
+                                await event.reply("🔑 **Active Promotion Keyword:** `None/Disabled`\nUse `.setpromo <word>` to set one.")
+                            return
+
                     except Exception as err:
                         logger.error(f"Command execution error: {err}")
                         await event.reply(f"❌ **Command Error:** {err}")
@@ -2667,6 +2768,51 @@ def cmd_list_managers(message):
         bot.send_message(message.chat.id, "\n".join(text_lines), parse_mode="Markdown")
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Error fetching managers: {e}")
+
+@bot.message_handler(commands=['setpromo'])
+def cmd_set_promo(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "💡 *Usage:* `/setpromo [keyword]` (or `/setpromo disable` to turn off)", parse_mode="Markdown")
+        return
+    
+    keyword = args[1]
+    if keyword.lower() in ['disable', 'none', 'off']:
+        set_setting("promotion_keyword", "")
+        bot.reply_to(message, "✅ *Promotion Keyword Disabled.* Anyone sending the keyword will no longer be promoted.", parse_mode="Markdown")
+    else:
+        set_setting("promotion_keyword", keyword)
+        bot.reply_to(message, f"✅ *Promotion Keyword Set!*\n\nKeyword: `{keyword}`\nUsers sending this exact code in DMs will be automatically promoted to Manager.", parse_mode="Markdown")
+
+@bot.message_handler(commands=['promo'])
+def cmd_get_promo(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    keyword = get_setting("promotion_keyword")
+    if keyword:
+        bot.reply_to(message, f"🔑 *Active Promotion Keyword:* `{keyword}`\nUsers sending this exact code in DMs will be promoted.", parse_mode="Markdown")
+    else:
+        bot.reply_to(message, "🔑 *Active Promotion Keyword:* `None/Disabled`\nUse `/setpromo [word]` to set one.", parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: not is_authorized_manager(m.from_user.id))
+def handle_unauthorized_direct_message(message):
+    text = message.text.strip() if message.text else ""
+    if not text: return
+    
+    # We need to run it in the event loop because check_and_promote_user is async and needs Telethon userbot
+    async def run_promo_check():
+        is_ok, msg = await ensure_userbot()
+        if not is_ok:
+            return
+            
+        async def bot_reply(reply_text):
+            bot.reply_to(message, reply_text, parse_mode="Markdown")
+            
+        await check_and_promote_user(userbot, message.from_user.id, message.from_user.username, text, bot_reply)
+
+    asyncio.run_coroutine_threadsafe(run_promo_check(), loop)
 
 def parse_telegram_link(text):
     import re

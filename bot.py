@@ -1585,7 +1585,7 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
     except Exception as e:
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
 
-async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid):
+async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid, pre_downloaded=None):
     """Unified Hub for mirrored sending with native Forum Topic support."""
     try:
         if not messages: return
@@ -1650,12 +1650,18 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
         album_text = next((msg.message for msg in messages if msg.message), "")
         sent = None
         
+        # Determine the file/media to send
+        if pre_downloaded:
+            file_to_send = pre_downloaded if len(pre_downloaded) > 1 else pre_downloaded[0]
+        else:
+            file_to_send = [m.media for m in messages] if len(messages) > 1 else messages[0].media
+        
         for attempt in range(3):
             try:
                 sent = await client.send_message(
                     entity=target_entity, 
                     message=album_text, 
-                    file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
+                    file=file_to_send,
                     reply_to=reply_header
                 )
                 if sent:
@@ -1680,7 +1686,7 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         sent = await client.send_message(
                             entity=target_entity, 
                             message=album_text, 
-                            file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
+                            file=file_to_send,
                             reply_to=next_reply_header
                         )
                         if sent:
@@ -1695,7 +1701,7 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                                 sent = await client.send_message(
                                     entity=target_entity, 
                                     message=album_text, 
-                                    file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
+                                    file=file_to_send,
                                     reply_to=None
                                 )
                                 if sent:
@@ -1709,7 +1715,7 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                             e = e2
                 
                 # If still failed, check if we need to do fallback download & upload
-                if not sent:
+                if not sent and not pre_downloaded:
                     err_msg = str(e).lower()
                     if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"]):
                         logger.info("🛡️ MIRROR: Protected or invalid peer media detected. Using fallback...")
@@ -1719,6 +1725,8 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
                         if attempt == 2: # Last attempt
                             logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
+                elif not sent and pre_downloaded:
+                    logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED (pre-downloaded): {e}")
         
     except Exception as e:
         logger.error(f"Global Mirror Error: {e}")
@@ -1822,6 +1830,134 @@ def get_pair_source_counts(pair_id):
         return mon, scr, col
 
 
+async def process_automation_pipeline(client, messages, source_chat_id):
+    """
+    Unified execution core. 
+    Downloads restricted content exactly once, distributing safely 
+    across all operational channels (Live, Vault, DB).
+    """
+    pairs = get_target_pairs()
+    first_msg = messages[0]
+    
+    # 1. Topic Identification Routing
+    msg_topic_anchor = None
+    if first_msg.reply_to:
+        msg_topic_anchor = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+    if not msg_topic_anchor and getattr(first_msg, 'forum_topic', False):
+        msg_topic_anchor = first_msg.id
+    if not msg_topic_anchor and first_msg.reply_to_msg_id:
+        msg_topic_anchor = first_msg.reply_to_msg_id
+
+    # 2. Pre-download files safely if the chat is restricted/protected
+    downloaded_files = []
+    is_protected_flow = False
+    
+    try:
+        chat_peer = await client.get_entity(source_chat_id)
+        is_protected_flow = getattr(chat_peer, 'noforwards', False)
+    except Exception as e:
+        logger.error(f"Failed to check noforwards for chat {source_chat_id}: {e}")
+        is_protected_flow = False
+
+    if is_protected_flow:
+        logger.info(f"🛡️ PIPELINE: Protected source chat detected ({source_chat_id}). Pre-downloading media...")
+        for msg in messages:
+            if msg.media:
+                try:
+                    path = await client.download_media(msg.media)
+                    if path:
+                        downloaded_files.append(path)
+                except Exception as e:
+                    logger.error(f"Failed to download media for message {msg.id}: {e}")
+
+    try:
+        already_vaulted = False
+        
+        for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
+            source_id_str = str(sid).replace("-100", "")
+            msg_id_str = str(source_chat_id).replace("-100", "")
+            
+            if source_id_str != msg_id_str:
+                continue
+
+            # Topic Context Verification
+            topic_filter_id = None
+            if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
+                try: topic_filter_id = int(s_topic)
+                except: pass
+            if topic_filter_id is not None and str(msg_topic_anchor) != str(topic_filter_id):
+                continue
+
+            # Content Filter Validation Rules
+            cf_val = cf or "everything"
+            if cf_val == "media" and not any(msg.media for msg in messages): continue
+            if cf_val == "text" and any(msg.media for msg in messages): continue
+
+            # Execution Step A: Database Operations
+            if is_mon:
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    for msg in messages:
+                        m_type = get_specific_media_type(msg.media)
+                        if USING_POSTGRES:
+                            c.execute(
+                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'monitor') ON CONFLICT DO NOTHING",
+                                (pid, sid, msg.id, m_type, msg.message or "")
+                            )
+                        else:
+                            c.execute(
+                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'monitor')",
+                                (pid, sid, msg.id, m_type, msg.message or "")
+                            )
+
+            # Execution Step B: Live Mirror/Forward Engine Routine
+            if is_live:
+                if is_protected_flow and downloaded_files:
+                    await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid, pre_downloaded=downloaded_files)
+                else:
+                    await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid)
+
+            # Execution Step C: Backup Storage Vault Allocation
+            if is_mon and not already_vaulted:
+                # Passes pre-downloaded files to log fleet avoiding a second round of downloads
+                if is_protected_flow and downloaded_files:
+                    bots = get_log_bots()
+                    for token, username, bot_id in bots:
+                        metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
+                        caption_text = metadata + (first_msg.message or "")
+                        try:
+                            vaulted_result = await client.send_message(
+                                entity=int(bot_id),
+                                file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
+                                message=caption_text
+                            )
+                            if vaulted_result:
+                                v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+                                for i, v_m in enumerate(v_msgs):
+                                    orig_m = messages[i]
+                                    save_logged_media(
+                                        bot_id=int(bot_id),
+                                        log_msg_id=int(v_m.id),
+                                        source_chat_id=int(source_chat_id),
+                                        source_msg_id=int(orig_m.id),
+                                        file_id=None,
+                                        media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                                        caption=orig_m.message or "",
+                                        grouped_id=orig_m.grouped_id
+                                    )
+                        except Exception as e:
+                            logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                else:
+                    asyncio.create_task(forward_to_log_bots(client, messages, sid))
+                already_vaulted = True
+
+    finally:
+        # Strict memory-leak garbage collection cleanup 
+        for temp_path in downloaded_files:
+            if os.path.exists(temp_path):
+                try: os.remove(temp_path)
+                except: pass
+
 def setup_automation_handlers(client: TelegramClient):
     if getattr(client, '_automation_handlers_registered', False):
         logger.info("Automation handlers already registered on this client. Skipping.")
@@ -1885,135 +2021,22 @@ def setup_automation_handlers(client: TelegramClient):
             if m.grouped_id not in album_cache:
                 album_cache[m.grouped_id] = [m]
                 
-                # Single album delayed task that processes all matching pairs chronological
+                # Consolidated delayed task that processes all rules sequentially
                 async def delayed_send_album(gid, s_id):
-                    await asyncio.sleep(5.0)
+                    await asyncio.sleep(3.5)  # Slightly reduced to stay well inside the update loop
                     messages = album_cache.pop(gid, [])
                     if not messages: return
                     
-                    pairs = get_target_pairs()
-                    already_vaulted = False
-                    
-                    for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
-                        source_id_str = str(sid).replace("-100", "")
-                        target_id_str = str(s_id).replace("-100", "")
-                        
-                        if source_id_str == target_id_str:
-                            # --- TOPIC DETECTION ---
-                            first_msg = messages[0]
-                            msg_topic_anchor = None
-                            if first_msg.reply_to:
-                                msg_topic_anchor = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
-                            if not msg_topic_anchor and getattr(first_msg, 'forum_topic', False):
-                                msg_topic_anchor = first_msg.id
-                            if not msg_topic_anchor and first_msg.reply_to_msg_id:
-                                msg_topic_anchor = first_msg.reply_to_msg_id
-
-                            topic_filter_id = None
-                            if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
-                                try: topic_filter_id = int(s_topic)
-                                except: pass
-                            
-                            if topic_filter_id is not None:
-                                if str(msg_topic_anchor) != str(topic_filter_id):
-                                    continue
-
-                            # --- CONTENT FILTERING ---
-                            cf_val = cf or "everything"
-                            if cf_val == "media" and not any(msg.media for msg in messages):
-                                continue
-                            if cf_val == "text" and any(msg.media for msg in messages):
-                                continue
-                                
-                            # --- MONITOR: SAVE TO DB ---
-                            if is_mon:
-                                with db_conn() as conn:
-                                    c = conn.cursor()
-                                    for msg in messages:
-                                        m_type = get_specific_media_type(msg.media)
-                                        if USING_POSTGRES:
-                                            c.execute(
-                                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'monitor') ON CONFLICT DO NOTHING",
-                                                (pid, sid, msg.id, m_type, msg.message or "")
-                                            )
-                                        else:
-                                            c.execute(
-                                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'monitor')",
-                                                (pid, sid, msg.id, m_type, msg.message or "")
-                                            )
-
-                            # --- LIVE FORWARD: SEND TO TARGET ---
-                            if is_live:
-                                await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid)
-                                
-                            # --- MONITOR: VAULT TO LOG BOTS (once per album execution) ---
-                            if is_mon and not already_vaulted:
-                                asyncio.create_task(forward_to_log_bots(client, messages, sid))
-                                already_vaulted = True
+                    await process_automation_pipeline(client, messages, s_id)
                 
                 asyncio.create_task(delayed_send_album(m.grouped_id, m.chat_id))
             else:
-                album_cache[m.grouped_id].append(m)
+                # Add to existing collection bundle safely
+                if m.id not in [msg.id for msg in album_cache[m.grouped_id]]:
+                    album_cache[m.grouped_id].append(m)
         else:
-            # Single Message Flow
-            pairs = get_target_pairs()
-            already_vaulted = False
-            for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
-                source_id_str = str(sid).replace("-100", "")
-                msg_id_str = str(m.chat_id).replace("-100", "")
-
-                if source_id_str == msg_id_str:
-                    # --- TOPIC DETECTION ---
-                    msg_topic_anchor = None
-                    if m.reply_to:
-                        msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
-                    
-                    if not msg_topic_anchor and getattr(m, 'forum_topic', False):
-                        msg_topic_anchor = m.id
-                    
-                    if not msg_topic_anchor and m.reply_to_msg_id:
-                        msg_topic_anchor = m.reply_to_msg_id
-
-                    # --- CONTENT FILTERING ---
-                    cf_val = cf or "everything"
-                    if cf_val == "media" and not m.media:
-                        continue
-                    if cf_val == "text" and m.media:
-                        continue
-
-                    topic_filter_id = None
-                    if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
-                        try: topic_filter_id = int(s_topic)
-                        except: pass
-                    
-                    if topic_filter_id is not None:
-                        if str(msg_topic_anchor) != str(topic_filter_id):
-                            continue
-
-                    # --- MONITOR: SAVE TO DB ---
-                    if is_mon:
-                        m_type = get_specific_media_type(m.media)
-                        with db_conn() as conn:
-                            c = conn.cursor()
-                            if USING_POSTGRES:
-                                c.execute(
-                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'monitor') ON CONFLICT DO NOTHING",
-                                    (pid, sid, m.id, m_type, m.message or "")
-                                )
-                            else:
-                                c.execute(
-                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'monitor')",
-                                    (pid, sid, m.id, m_type, m.message or "")
-                                )
-
-                    # --- LIVE FORWARD: SEND TO TARGET ---
-                    if is_live:
-                        await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
-                    
-                    # --- MONITOR: VAULT TO LOG BOTS (once per message execution) ---
-                    if is_mon and not already_vaulted:
-                        asyncio.create_task(forward_to_log_bots(client, [m], sid))
-                        already_vaulted = True
+            # Single Message Flow routed through the exact same processing core
+            await process_automation_pipeline(client, [m], m.chat_id)
 @bot.message_handler(commands=['start', 'dash'])
 def cmd_start(message):
     if message.from_user.id != ADMIN_ID:

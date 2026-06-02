@@ -12,6 +12,8 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+BOT_START_TIME = datetime.now(timezone.utc)
+
 import requests
 import signal
 import sys
@@ -99,6 +101,63 @@ album_cache = {}
 # Deduplication cache for incoming message events
 processed_messages = set()
 processed_messages_queue = deque(maxlen=2000)
+
+def is_message_processed(chat_id, msg_id):
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"SELECT 1 FROM processed_messages WHERE chat_id = {p} AND msg_id = {p}", (chat_id, msg_id))
+            return c.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Error checking processed message in DB: {e}")
+        return False
+
+def mark_message_processed(chat_id, msg_id):
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            if USING_POSTGRES:
+                c.execute(
+                    "INSERT INTO processed_messages (chat_id, msg_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    (chat_id, msg_id)
+                )
+            else:
+                c.execute(
+                    "INSERT OR IGNORE INTO processed_messages (chat_id, msg_id) VALUES (?, ?)",
+                    (chat_id, msg_id)
+                )
+    except Exception as e:
+        logger.error(f"Error marking message processed in DB: {e}")
+
+def cleanup_old_processed_messages():
+    """Deletes processed message records older than 7 days."""
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            if USING_POSTGRES:
+                c.execute("DELETE FROM processed_messages WHERE timestamp < NOW() - INTERVAL '7 days'")
+            else:
+                c.execute("DELETE FROM processed_messages WHERE timestamp < datetime('now', '-7 days')")
+            logger.info("Cleared processed messages older than 7 days.")
+    except Exception as e:
+        logger.error(f"Error cleaning up old processed messages: {e}")
+
+def load_processed_messages_cache():
+    global processed_messages, processed_messages_queue
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute("SELECT chat_id, msg_id FROM processed_messages ORDER BY timestamp DESC LIMIT 2000")
+            rows = c.fetchall()
+            for chat_id, msg_id in reversed(rows):
+                msg_key = (chat_id, msg_id)
+                processed_messages.add(msg_key)
+                processed_messages_queue.append(msg_key)
+            logger.info(f"Loaded {len(processed_messages)} processed messages into memory cache.")
+    except Exception as e:
+        logger.error(f"Error loading processed messages cache: {e}")
 
 def get_placeholder(conn=None):
     if DATABASE_URL and USING_POSTGRES:
@@ -262,6 +321,16 @@ def init_db():
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            # Processed Messages Table
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS processed_messages (
+                    chat_id BIGINT,
+                    msg_id BIGINT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(chat_id, msg_id)
+                )
+            """)
         else:
             # SQLite
             c.execute("""
@@ -399,10 +468,28 @@ def init_db():
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            # Processed Messages Table
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS processed_messages (
+                    chat_id BIGINT,
+                    msg_id BIGINT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(chat_id, msg_id)
+                )
+            """)
     try:
         cleanup_duplicate_pairs()
     except Exception as e:
         logger.error(f"Error calling cleanup_duplicate_pairs in init_db: {e}")
+    try:
+        cleanup_old_processed_messages()
+    except Exception as e:
+        logger.error(f"Error calling cleanup_old_processed_messages in init_db: {e}")
+    try:
+        load_processed_messages_cache()
+    except Exception as e:
+        logger.error(f"Error calling load_processed_messages_cache in init_db: {e}")
     logger.info("DB initialized")
 
 def is_user_banned(user_id, username=None):
@@ -1758,16 +1845,33 @@ def setup_automation_handlers(client: TelegramClient):
         if m.out or (me and m.sender_id == me.id):
             return
 
-        # Deduplicate message events to prevent duplicate processing
+        # Check if the message is too old (e.g., older than 10 minutes before bot startup)
+        # to prevent massive replay of history on a fresh DB start/wipe
+        msg_date = m.date
+        if msg_date:
+            # Ensure msg_date is timezone-aware
+            if msg_date.tzinfo is None:
+                msg_date = msg_date.replace(tzinfo=timezone.utc)
+            if (BOT_START_TIME - msg_date).total_seconds() > 600:
+                logger.info(f"⏳ Ignore old catchup message {m.id} in chat {m.chat_id} (Date: {msg_date})")
+                return
+
+        # Deduplicate message events to prevent duplicate processing (RAM + DB lookup)
         msg_key = (m.chat_id, m.id)
-        if msg_key in processed_messages:
+        if msg_key in processed_messages or is_message_processed(m.chat_id, m.id):
+            if msg_key not in processed_messages:
+                processed_messages.add(msg_key)
+                processed_messages_queue.append(msg_key)
             logger.info(f"🔄 Ignore duplicate event for message {m.id} in chat {m.chat_id}")
             return
+        
+        # Mark immediately as processed in memory and DB
         processed_messages.add(msg_key)
         processed_messages_queue.append(msg_key)
         if len(processed_messages) > 2000:
             processed_messages.clear()
             processed_messages.update(processed_messages_queue)
+        mark_message_processed(m.chat_id, m.id)
 
         # --- BAN LIST CHECK ---
         sender_id = m.sender_id

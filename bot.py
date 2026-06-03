@@ -1864,15 +1864,29 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
         reply_header = None
         if is_forum:
             reply_header = int(dest_topic_id) if dest_topic_id else None
+            
+            top_msg_id = None
+            if first_msg.reply_to:
+                top_msg_id = getattr(first_msg.reply_to, 'reply_to_top_id', None)
+                if not top_msg_id and first_msg.reply_to.reply_to_msg_id:
+                    top_msg_id = first_msg.reply_to.reply_to_msg_id
+            
+            if top_msg_id:
+                mapped_top = get_message_mapping(sid, top_msg_id, tid)
+                if mapped_top:
+                    reply_header = int(mapped_top)
+            
             # If replying to a specific message inside the topic, use mapped ID
-            if first_msg.reply_to_msg_id:
+            if first_msg.reply_to_msg_id and (not top_msg_id or first_msg.reply_to_msg_id != top_msg_id):
                 mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                if mapped: reply_header = int(mapped)
+                if mapped:
+                    reply_header = int(mapped)
         else:
             # Normal Group: Use Message Mapping for Replies
             if first_msg.reply_to_msg_id:
                 mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                if mapped: reply_header = int(mapped)
+                if mapped:
+                    reply_header = int(mapped)
 
         # 4. Send Content
         album_text = next((msg.message for msg in messages if msg.message), "")
@@ -1887,16 +1901,16 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         if m.id in pre_downloaded:
                             files_to_send.append(pre_downloaded[m.id])
                         else:
-                            files_to_send.append(m.media)
+                            files_to_send.append(m)
             elif isinstance(pre_downloaded, list):
                 media_msgs = [m for m in messages if m.media]
                 for idx, m in enumerate(media_msgs):
                     if idx < len(pre_downloaded):
                         files_to_send.append(pre_downloaded[idx])
                     else:
-                        files_to_send.append(m.media)
+                        files_to_send.append(m)
         else:
-            files_to_send = [m.media for m in messages if m.media]
+            files_to_send = [m for m in messages if m.media]
             
         file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
         
@@ -2164,7 +2178,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                     if is_protected_flow and has_media and not any(m.id in media_to_file for m in valid_messages):
                         logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} (Download Failed).")
                     else:
-                        await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid, pre_downloaded=media_to_file if has_media else None)
+                        await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
                 else:
                     # Unrestricted flow: perform standard native forward safely
                     try:

@@ -5052,8 +5052,10 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
         display_filter = f_names.get(release_filter, "All Content 🔄")
         status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items from {category_name}...\n🎯 Filter: `{display_filter}`", reply_markup=markup)
         
-        for row_id, smid in items:
+        idx = 0
+        while idx < len(items):
             if not running_tasks.get(task_key): break
+            row_id, smid = items[idx]
             
             try:
                 msg = await userbot.get_messages(source_chat, ids=smid)
@@ -5159,13 +5161,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                             try:
                                 local_file = await userbot.download_media(msg)
                             except errors.FloodWaitError as fwe:
-                                logger.warning(f"⏳ RELEASE FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping this item.")
-                                if fwe.seconds <= 5:
-                                    await asyncio.sleep(fwe.seconds)
-                                    try:
-                                        local_file = await userbot.download_media(msg)
-                                    except Exception as e2:
-                                        logger.error(f"Failed to download in release after short wait: {e2}")
+                                raise fwe
                             except Exception as de:
                                 logger.error(f"Failed to download media in release fallback: {de}")
                             if local_file:
@@ -5227,8 +5223,22 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                     try: bot.edit_message_text(f"🚀 Releasing `{s_title}` ({category_name})...\n🎯 Filter: `{display_filter}`\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
                     except Exception: pass
                 await asyncio.sleep(interval)
+                idx += 1
+            except errors.FloodWaitError as fwe:
+                logger.warning(f"⏳ RELEASE FLOOD: A wait of {fwe.seconds} seconds is required. Sleeping...")
+                try:
+                    bot.edit_message_text(
+                        f"⏳ *Release Rate-Limited*\n\nWaiting `{fwe.seconds}` seconds before retrying message ID `{smid}`...",
+                        admin_chat_id,
+                        status_msg.message_id,
+                        reply_markup=markup
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(fwe.seconds)
             except Exception as e:
                 logger.error(f"Release error: {e}")
+                idx += 1
 
         bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items from {category_name} matching `{display_filter}`.")
     except Exception as e:

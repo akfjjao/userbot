@@ -1785,6 +1785,7 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
 
 async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid, pre_downloaded=None):
     """Unified Hub for mirrored sending with native Forum Topic support."""
+    downloaded_files = []
     try:
         if not messages: return
         first_msg = messages[0]
@@ -1873,51 +1874,91 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
             except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
                 await asyncio.sleep(2)
             except Exception as e:
-                # If we had a reply_header set, attempt to fallback/downgrade reply first
-                if reply_header is not None:
-                    next_reply_header = None
-                    if is_forum and dest_topic_id and reply_header != int(dest_topic_id):
-                        next_reply_header = int(dest_topic_id)
-                    
-                    logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={reply_header} ({e}). Retrying with reply_to={next_reply_header}...")
-                    try:
-                        sent = await client.send_message(
-                            entity=target_entity, 
-                            message=album_text, 
-                            file=file_to_send,
-                            reply_to=next_reply_header
-                        )
-                        if sent:
-                            first_id = sent[0].id if isinstance(sent, list) else sent.id
-                            logger.info(f"✅ MIRROR: Sent after reply downgrade to {tid} -> MSG ID: {first_id}")
-                            save_message_mapping(sid, first_msg.id, tid, first_id)
-                            break
-                    except Exception as e2:
-                        if next_reply_header is not None:
-                            logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={next_reply_header} ({e2}). Retrying with reply_to=None...")
+                # If the error is due to protected/restricted media, try downloading and uploading it
+                err_msg = str(e).lower()
+                is_protected_error = any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer", "empty"])
+                
+                # Check if we should attempt download & upload fallback
+                if is_protected_error and not pre_downloaded and not downloaded_files and any(m.media for m in messages):
+                    logger.info(f"🛡️ MIRROR: Protected/empty media error detected ({e}). Attempting download & upload fallback...")
+                    for m in messages:
+                        if m.media:
                             try:
-                                sent = await client.send_message(
-                                    entity=target_entity, 
-                                    message=album_text, 
-                                    file=file_to_send,
-                                    reply_to=None
-                                )
-                                if sent:
-                                    first_id = sent[0].id if isinstance(sent, list) else sent.id
-                                    logger.info(f"✅ MIRROR: Sent after final reply clear to {tid} -> MSG ID: {first_id}")
-                                    save_message_mapping(sid, first_msg.id, tid, first_id)
-                                    break
-                            except Exception as e3:
-                                e = e3
-                        else:
-                            e = e2
+                                path = await client.download_media(m.media)
+                                if path:
+                                    downloaded_files.append(path)
+                            except Exception as de:
+                                logger.error(f"Mirror download fallback failed: {de}")
+                    
+                    if downloaded_files:
+                        file_to_send = downloaded_files if len(downloaded_files) > 1 else downloaded_files[0]
+                        # Retry sending immediately in this attempt using the local file
+                        try:
+                            sent = await client.send_message(
+                                entity=target_entity,
+                                message=album_text,
+                                file=file_to_send,
+                                reply_to=reply_header
+                            )
+                            if sent:
+                                first_id = sent[0].id if isinstance(sent, list) else sent.id
+                                logger.info(f"✅ MIRROR: Sent via fallback to {tid} -> MSG ID: {first_id}")
+                                save_message_mapping(sid, first_msg.id, tid, first_id)
+                                break
+                        except Exception as fe:
+                            e = fe
+                
+                # If still not sent, attempt reply fallbacks/downgrades
+                if not sent:
+                    if reply_header is not None:
+                        next_reply_header = None
+                        if is_forum and dest_topic_id and reply_header != int(dest_topic_id):
+                            next_reply_header = int(dest_topic_id)
+                        
+                        logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={reply_header} ({e}). Retrying with reply_to={next_reply_header}...")
+                        try:
+                            sent = await client.send_message(
+                                entity=target_entity, 
+                                message=album_text, 
+                                file=file_to_send,
+                                reply_to=next_reply_header
+                            )
+                            if sent:
+                                first_id = sent[0].id if isinstance(sent, list) else sent.id
+                                logger.info(f"✅ MIRROR: Sent after reply downgrade to {tid} -> MSG ID: {first_id}")
+                                save_message_mapping(sid, first_msg.id, tid, first_id)
+                                break
+                        except Exception as e2:
+                            if next_reply_header is not None:
+                                logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={next_reply_header} ({e2}). Retrying with reply_to=None...")
+                                try:
+                                    sent = await client.send_message(
+                                        entity=target_entity, 
+                                        message=album_text, 
+                                        file=file_to_send,
+                                        reply_to=None
+                                    )
+                                    if sent:
+                                        first_id = sent[0].id if isinstance(sent, list) else sent.id
+                                        logger.info(f"✅ MIRROR: Sent after final reply clear to {tid} -> MSG ID: {first_id}")
+                                        save_message_mapping(sid, first_msg.id, tid, first_id)
+                                        break
+                                except Exception as e3:
+                                    e = e3
+                            else:
+                                e = e2
                 
                 logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
                 if attempt == 2: # Last attempt
                     logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
-        
+                    
     except Exception as e:
         logger.error(f"Global Mirror Error: {e}")
+    finally:
+        for path in downloaded_files:
+            if os.path.exists(path):
+                try: os.remove(path)
+                except Exception: pass
 
 
 def get_specific_media_type(media):

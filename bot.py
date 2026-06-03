@@ -2099,7 +2099,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                 is_reply = any(getattr(msg, 'reply_to_msg_id', None) for msg in messages)
                 if is_protected_flow or is_reply:
                     has_media = any(m.media for m in messages)
-                    if has_media and not downloaded_files:
+                    if is_protected_flow and has_media and not downloaded_files:
                         logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} because media download failed/skipped on protected chat.")
                     else:
                         await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid, pre_downloaded=downloaded_files if has_media else None)

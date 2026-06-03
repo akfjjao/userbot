@@ -98,6 +98,7 @@ USING_POSTGRES = False
 # Album Cache for grouping media
 # {grouped_id: [message_objects]}
 album_cache = {}
+album_processing_lock = set() # Track groups actively running pipeline execution
 
 # Deduplication cache for incoming message events
 processed_messages = set()
@@ -2004,10 +2005,11 @@ def get_pair_source_counts(pair_id):
 async def process_automation_pipeline(client, messages, source_chat_id):
     """
     Unified execution core. 
-    Downloads restricted content exactly once, distributing safely 
-    across all operational channels (Live, Vault, DB).
+    Correctly updates network entity maps and routes mixed message batches securely.
     """
     pairs = get_target_pairs()
+    if not messages: 
+        return
     first_msg = messages[0]
     
     # 1. Topic Identification Routing
@@ -2019,57 +2021,60 @@ async def process_automation_pipeline(client, messages, source_chat_id):
     if not msg_topic_anchor and first_msg.reply_to_msg_id:
         msg_topic_anchor = first_msg.reply_to_msg_id
 
-    # 2. Pre-download files safely if the chat is restricted/protected
-    downloaded_files = []
+    # 2. FIXED: Reliable Live Entity Fetching & Map Syncing
     is_protected_flow = False
-    
     try:
         chat_peer = await client.get_entity(source_chat_id)
-        is_protected_flow = getattr(chat_peer, 'noforwards', False)
-        if is_protected_flow:
-            # Stale cache check: force fetch from network to verify if it is still restricted
-            try:
-                from telethon.tl.functions.channels import GetChannelsRequest
-                res = await client(GetChannelsRequest(id=[chat_peer]))
+        # Check initial flag status
+        if getattr(chat_peer, 'noforwards', False):
+            # Force structural updates over the network wire to purge stale attributes
+            from telethon.tl.functions.channels import GetChannelsRequest
+            from telethon.tl.types import InputChannel
+            
+            if hasattr(chat_peer, 'access_hash'):
+                input_channel = InputChannel(chat_peer.id, chat_peer.access_hash)
+                res = await client(GetChannelsRequest(id=[input_channel]))
                 if res and res.chats:
                     fresh_peer = res.chats[0]
                     is_protected_flow = getattr(fresh_peer, 'noforwards', False)
-                    client._entity_cache.add(fresh_peer)
-            except Exception as cache_err:
-                logger.debug(f"Failed to refresh stale entity cache for {source_chat_id}: {cache_err}")
+                    # Correctly bind the structural entity metadata to Telethon's internal maps
+                    if hasattr(client, '_entity_cache') and hasattr(client._entity_cache, 'add'):
+                        client._entity_cache.add(fresh_peer)
+                    elif hasattr(client, '_mb_entity_cache'):
+                        client._mb_entity_cache.extend([], [fresh_peer])
+            else:
+                is_protected_flow = getattr(chat_peer, 'noforwards', False)
     except Exception as e:
-        logger.error(f"Failed to check noforwards for chat {source_chat_id}: {e}")
+        logger.error(f"Failed to refresh stale entity cache for chat {source_chat_id}: {e}")
         is_protected_flow = False
 
+    # 3. Pre-download files safely if the chat is truly restricted
+    media_to_file = {} # {msg_id: local_path}
     if is_protected_flow:
-        logger.info(f"🛡️ PIPELINE: Protected source chat detected ({source_chat_id}). Pre-downloading media...")
+        logger.info(f"🛡️ PIPELINE: Protected source chat verified (-100{str(source_chat_id).replace('-100', '')}). Pre-downloading media...")
         for msg in messages:
             if msg.media:
                 try:
                     path = await client.download_media(msg)
                     if path:
-                        downloaded_files.append(path)
+                        media_to_file[msg.id] = path
                 except errors.FloodWaitError as fwe:
-                    logger.warning(f"⏳ PIPELINE FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
-                    if fwe.seconds <= 5:
-                        await asyncio.sleep(fwe.seconds)
-                        try:
-                            path = await client.download_media(msg)
-                            if path:
-                                downloaded_files.append(path)
-                        except Exception as e2:
-                            logger.error(f"Failed to download media after short flood wait: {e2}")
+                    logger.warning(f"⏳ PIPELINE FLOOD: Download limit hit. Sleeping {fwe.seconds}s...")
+                    await asyncio.sleep(fwe.seconds)
+                    try:
+                        path = await client.download_media(msg)
+                        if path: media_to_file[msg.id] = path
+                    except Exception: pass
                 except Exception as e:
-                    logger.error(f"Failed to download media for message {msg.id}: {e}")
+                    logger.error(f"Failed to copy media asset: {e}")
 
     try:
         already_vaulted = False
+        msg_chat_str = str(source_chat_id).replace("-100", "")
         
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
             source_id_str = str(sid).replace("-100", "")
-            msg_id_str = str(source_chat_id).replace("-100", "")
-            
-            if source_id_str != msg_id_str:
+            if source_id_str != msg_chat_str:
                 continue
 
             # Topic Context Verification
@@ -2080,16 +2085,25 @@ async def process_automation_pipeline(client, messages, source_chat_id):
             if topic_filter_id is not None and str(msg_topic_anchor) != str(topic_filter_id):
                 continue
 
-            # Content Filter Validation Rules
+            # Content Filter Validation Rules (Evaluated on per-message context)
             cf_val = cf or "everything"
-            if cf_val == "media" and not any(msg.media for msg in messages): continue
-            if cf_val == "text" and any(msg.media for msg in messages): continue
+            valid_messages = []
+            for msg in messages:
+                has_media = bool(msg.media)
+                if cf_val == "media" and not has_media: continue
+                if cf_val == "text" and has_media: continue
+                valid_messages.append(msg)
+                
+            if not valid_messages:
+                continue
 
-            # Execution Step A: Database Operations
+            pair_downloaded = [media_to_file[m.id] for m in valid_messages if m.id in media_to_file]
+
+            # Execution Step A: Database Logging Operations
             if is_mon:
                 with db_conn() as conn:
                     c = conn.cursor()
-                    for msg in messages:
+                    for msg in valid_messages:
                         m_type = get_specific_media_type(msg.media)
                         rel_val = 1 if is_live else 0
                         if USING_POSTGRES:
@@ -2105,17 +2119,15 @@ async def process_automation_pipeline(client, messages, source_chat_id):
 
             # Execution Step B: Live Mirror/Forward Engine Routine
             if is_live:
-                # Fall back to custom mirroring if any message in the batch is a reply to another message
-                # to ensure that the reply connection is correctly mapped and preserved in the target chat.
-                is_reply = any(getattr(msg, 'reply_to_msg_id', None) for msg in messages)
+                is_reply = any(getattr(msg, 'reply_to_msg_id', None) for msg in valid_messages)
                 if is_protected_flow or is_reply:
-                    has_media = any(m.media for m in messages)
-                    if is_protected_flow and has_media and not downloaded_files:
-                        logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} because media download failed/skipped on protected chat.")
+                    has_media = any(m.media for m in valid_messages)
+                    if is_protected_flow and has_media and not pair_downloaded:
+                        logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} (Download Failed).")
                     else:
-                        await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid, pre_downloaded=downloaded_files if has_media else None)
+                        await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid, pre_downloaded=pair_downloaded if has_media else None)
                 else:
-                    # Unrestricted flow: perform standard Telegram forward!
+                    # Unrestricted flow: perform standard native forward safely
                     try:
                         src_peer = await client.get_input_entity(int(sid))
                         tgt_peer = await client.get_input_entity(int(tid))
@@ -2131,11 +2143,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                                     try:
                                         resolved_sid = await resolve_target_id(client, sid)
                                         res = await client(functions.messages.GetForumTopicsRequest(
-                                            peer=resolved_sid,
-                                            offset_date=0,
-                                            offset_id=0,
-                                            offset_topic=0,
-                                            limit=100
+                                            peer=resolved_sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
                                         ))
                                         for t in res.topics:
                                             if t.id == source_top:
@@ -2145,23 +2153,18 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                                     except Exception: pass
                                 
                                 if src_title:
-                                    logger.info(f"FORWARD: Resolving target topic for title: '{src_title}'")
                                     dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
 
                         import random
-                        random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in messages]
-                        
+                        random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in valid_messages]
                         target_entity = await resolve_target_id(client, tid)
                         is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
                         
-                        top_msg_id_val = None
-                        if is_forum:
-                            top_msg_id_val = int(dest_topic_id) if dest_topic_id else None
+                        top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
                         
-                        # Native standard forward
                         fwd_res = await client(functions.messages.ForwardMessagesRequest(
                             from_peer=src_peer,
-                            id=[msg.id for msg in messages],
+                            id=[msg.id for msg in valid_messages],
                             to_peer=tgt_peer,
                             random_id=random_ids,
                             top_msg_id=top_msg_id_val
@@ -2174,61 +2177,53 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                                     if type(u).__name__ in ["UpdateNewMessage", "UpdateNewChannelMessage"]:
                                         fwd_msgs.append(u.message)
                             
-                            if len(fwd_msgs) == len(messages):
-                                for orig_m, fwd_m in zip(messages, fwd_msgs):
+                            if len(fwd_msgs) == len(valid_messages):
+                                for orig_m, fwd_m in zip(valid_messages, fwd_msgs):
                                     save_message_mapping(sid, orig_m.id, tid, fwd_m.id)
-                                    logger.info(f"✅ FORWARD: Standard forwarded message {orig_m.id} -> Target {tid} (Msg ID: {fwd_m.id})")
+                                    logger.info(f"✅ FORWARD: Native forward mapping established {orig_m.id} -> {fwd_m.id}")
                             else:
-                                logger.info(f"✅ FORWARD: Standard forwarded messages from source {sid} to target {tid}")
+                                logger.info(f"✅ FORWARD: Native forward successful across cluster from {sid}")
                                 
                     except Exception as fwd_err:
-                        logger.error(f"Failed standard forward from {sid} to {tid}: {fwd_err}. Falling back to custom mirror.")
-                        await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid)
+                        logger.error(f"Native Forward dropped ({fwd_err}). Activating fallback downmirror...")
+                        await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid)
 
             # Execution Step C: Backup Storage Vault Allocation
             if is_mon and not already_vaulted:
-                # Passes pre-downloaded files to log fleet avoiding a second round of downloads
                 if is_protected_flow:
-                    has_media = any(m.media for m in messages)
+                    has_media = any(m.media for m in valid_messages)
                     if has_media:
-                        if not downloaded_files:
-                            logger.warning(f"🛡️ PIPELINE: Skipping vaulting because media download failed/skipped on protected chat.")
-                        else:
+                        if pair_downloaded:
                             for token, username, bot_id in get_log_bots():
                                 metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
                                 caption_text = metadata + (first_msg.message or "")
                                 try:
                                     vaulted_result = await client.send_message(
                                         entity=int(bot_id),
-                                        file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
+                                        file=pair_downloaded if len(pair_downloaded) > 1 else pair_downloaded[0],
                                         message=caption_text
                                     )
                                     if vaulted_result:
                                         v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
                                         for i, v_m in enumerate(v_msgs):
-                                            orig_m = messages[i]
-                                            save_logged_media(
-                                                bot_id=int(bot_id),
-                                                log_msg_id=int(v_m.id),
-                                                source_chat_id=int(source_chat_id),
-                                                source_msg_id=int(orig_m.id),
-                                                file_id=None,
-                                                media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                                                caption=orig_m.message or "",
-                                                grouped_id=orig_m.grouped_id
-                                            )
+                                            if i < len(valid_messages):
+                                                orig_m = valid_messages[i]
+                                                save_logged_media(
+                                                    bot_id=int(bot_id), log_msg_id=int(v_m.id),
+                                                    source_chat_id=int(source_chat_id), source_msg_id=int(orig_m.id),
+                                                    file_id=None, media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                                                    caption=orig_m.message or "", grouped_id=orig_m.grouped_id
+                                                )
                                 except Exception as e:
-                                    logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                                    logger.error(f"Error executing backup synchronization pipeline: {e}")
                     else:
-                        # Text-only message on protected flow, or no media
-                        asyncio.create_task(forward_to_log_bots(client, messages, sid))
+                        asyncio.create_task(forward_to_log_bots(client, valid_messages, sid))
                 else:
-                    asyncio.create_task(forward_to_log_bots(client, messages, sid))
+                    asyncio.create_task(forward_to_log_bots(client, valid_messages, sid))
                 already_vaulted = True
 
     finally:
-        # Strict memory-leak garbage collection cleanup 
-        for temp_path in downloaded_files:
+        for temp_path in media_to_file.values():
             if os.path.exists(temp_path):
                 try: os.remove(temp_path)
                 except Exception: pass
@@ -2793,11 +2788,23 @@ def setup_automation_handlers(client: TelegramClient):
                 
                 # Consolidated delayed task that processes all rules sequentially
                 async def delayed_send_album(gid, s_id):
-                    await asyncio.sleep(3.5)  # Slightly reduced to stay well inside the update loop
+                    await asyncio.sleep(2.5)  # Time window optimization
                     messages = album_cache.pop(gid, [])
                     if not messages: return
                     
-                    await process_automation_pipeline(client, messages, s_id)
+                    # Prevent identical racing handler updates from repeating pipeline execution
+                    lock_key = f"{s_id}_{gid}"
+                    if lock_key in album_processing_lock:
+                        return
+                    album_processing_lock.add(lock_key)
+                    
+                    try:
+                        # Sort sequentially by message entry indexes
+                        messages.sort(key=lambda x: x.id)
+                        await process_automation_pipeline(client, messages, s_id)
+                    finally:
+                        # Safely clean garbage parameters and release loop execution tokens
+                        album_processing_lock.discard(lock_key)
                 
                 asyncio.create_task(delayed_send_album(m.grouped_id, m.chat_id))
             else:

@@ -1901,16 +1901,16 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         if m.id in pre_downloaded:
                             files_to_send.append(pre_downloaded[m.id])
                         else:
-                            files_to_send.append(m)
+                            files_to_send.append(m.media)
             elif isinstance(pre_downloaded, list):
                 media_msgs = [m for m in messages if m.media]
                 for idx, m in enumerate(media_msgs):
                     if idx < len(pre_downloaded):
                         files_to_send.append(pre_downloaded[idx])
                     else:
-                        files_to_send.append(m)
+                        files_to_send.append(m.media)
         else:
-            files_to_send = [m for m in messages if m.media]
+            files_to_send = [m.media for m in messages if m.media]
             
         file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
         
@@ -2187,9 +2187,8 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                         
                         dest_topic_id = t_topic
                         if is_mir:
-                            source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or (first_msg.reply_to.reply_to_msg_id if first_msg.reply_to else None)
-                            if source_top:
-                                forum = getattr(first_msg.reply_to, "forum_topic", None)
+                            if msg_topic_anchor:
+                                forum = getattr(first_msg.reply_to, "forum_topic", None) if first_msg.reply_to else None
                                 src_title = getattr(forum, "title", None)
                                 src_icon = None
                                 if not src_title:
@@ -2199,14 +2198,14 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                                             peer=resolved_sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
                                         ))
                                         for t in res.topics:
-                                            if t.id == source_top:
+                                            if t.id == msg_topic_anchor:
                                                 src_title = t.title
                                                 src_icon = getattr(t, "icon_emoji_id", None)
                                                 break
                                     except Exception: pass
                                 
                                 if src_title:
-                                    dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
+                                    dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, msg_topic_anchor, icon_emoji_id=src_icon)
 
                         import random
                         random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in valid_messages]
@@ -5097,8 +5096,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 """,
                                 (pair_id, sid_resolved, m.id, m_type, m.message or "", rel_val)
                             )
-                    if not USING_POSTGRES or not DATABASE_URL:
-                        conn.commit()
+                    conn.commit()
                 # 3. Send to log bots (through Vault) if instant release is active and matching_batch exists
                 if curr_instant and matching_batch:
                     has_media = any(msg.media for msg in matching_batch)

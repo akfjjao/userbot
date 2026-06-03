@@ -1169,6 +1169,21 @@ userbot = None
 admin_states = {}
 login_data = {} # Temporary storage for login steps
 running_tasks = {} # Track long-running tasks for cancellation: { "hist_1": True, "coll_1": True }
+collection_options = {} # Track collection options for active tasks: { "coll_1": {"instant_release": False} }
+
+def get_collection_markup(pair_id):
+    task_key = f"coll_{pair_id}"
+    options = collection_options.setdefault(task_key, {"instant_release": False})
+    instant_release = options.get("instant_release", False)
+    
+    markup = InlineKeyboardMarkup()
+    btn_stop = InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}")
+    if instant_release:
+        btn_toggle = InlineKeyboardButton("📥 Hold Release", callback_data=f"pair_coll_toggle_{pair_id}_hold")
+    else:
+        btn_toggle = InlineKeyboardButton("⚡ Instant Release", callback_data=f"pair_coll_toggle_{pair_id}_instant")
+    markup.row(btn_stop, btn_toggle)
+    return markup
 
 def stop_task(task_key):
     if task_key in running_tasks:
@@ -1981,15 +1996,16 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                     c = conn.cursor()
                     for msg in messages:
                         m_type = get_specific_media_type(msg.media)
+                        rel_val = 1 if is_live else 0
                         if USING_POSTGRES:
                             c.execute(
-                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'monitor') ON CONFLICT DO NOTHING",
-                                (pid, sid, msg.id, m_type, msg.message or "")
+                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (%s, %s, %s, %s, %s, 'monitor', %s) ON CONFLICT DO NOTHING",
+                                (pid, sid, msg.id, m_type, msg.message or "", rel_val)
                             )
                         else:
                             c.execute(
-                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'monitor')",
-                                (pid, sid, msg.id, m_type, msg.message or "")
+                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (?, ?, ?, ?, ?, 'monitor', ?)",
+                                (pid, sid, msg.id, m_type, msg.message or "", rel_val)
                             )
 
             # Execution Step B: Live Mirror/Forward Engine Routine
@@ -3796,6 +3812,56 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id, "🚀 Starting Collection...")
         asyncio.run_coroutine_threadsafe(run_collection(call.message.chat.id, pid), loop)
 
+    elif data.startswith("pair_coll_toggle_"):
+        parts = data.split("_")
+        # Structure: pair_coll_toggle_{pair_id}_{mode}
+        pid = int(parts[3])
+        mode = parts[4]
+        task_key = f"coll_{pid}"
+        
+        # Check if task is running
+        if task_key not in running_tasks or not running_tasks[task_key]:
+            bot.answer_callback_query(call.id, "❌ Collection is not currently running.")
+            return
+            
+        instant_rel = (mode == "instant")
+        opts = collection_options.setdefault(task_key, {})
+        opts["instant_release"] = instant_rel
+        
+        status_text = "⚡ Instant Release Enabled" if instant_rel else "📥 Hold Release Enabled"
+        bot.answer_callback_query(call.id, status_text)
+        
+        # Reconstruct the message text using saved states if available
+        if "s_title" in opts:
+            s_title = opts["s_title"]
+            scanned = opts["scanned"]
+            collected = opts["collected"]
+            limit = opts["limit"]
+            sent_count = opts["sent_count"]
+            
+            l_text = f" / {limit}" if limit else ""
+            sent_label = f"`{sent_count}`" if instant_rel else f"`{sent_count} (Hold)`"
+            
+            try:
+                bot.edit_message_text(
+                    f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: {sent_label}",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=get_collection_markup(pid),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Error editing message text in toggle callback: {e}")
+        else:
+            try:
+                bot.edit_message_reply_markup(
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=get_collection_markup(pid)
+                )
+            except Exception as e:
+                logger.error(f"Error editing reply markup in toggle callback: {e}")
+
     elif data.startswith("pair_release_"):
         pid = int(data.split("_")[-1])
         bot.answer_callback_query(call.id)
@@ -4333,12 +4399,12 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                                 c = conn.cursor()
                                 if USING_POSTGRES:
                                     c.execute(
-                                        "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'collection') ON CONFLICT DO NOTHING",
+                                        "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (%s, %s, %s, %s, %s, 'scraper', 1) ON CONFLICT DO NOTHING",
                                         (pair_id, sid_resolved, m.id, m_type, m.message or "")
                                     )
                                 else:
                                     c.execute(
-                                        "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'collection')",
+                                        "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (?, ?, ?, ?, ?, 'scraper', 1)",
                                         (pair_id, sid_resolved, m.id, m_type, m.message or "")
                                     )
                     
@@ -4436,6 +4502,16 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     task_key = f"coll_{pair_id}"
     running_tasks[task_key] = True
     
+    # Initialize collection options default state
+    collection_options[task_key] = {
+        "instant_release": False,
+        "s_title": "Source",
+        "scanned": 0,
+        "collected": 0,
+        "limit": limit,
+        "sent_count": 0
+    }
+    
     row = get_target_pair(pair_id)
     if not row: return
     # Unpack 11 fields including cf (content_filter)
@@ -4443,9 +4519,16 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     collected = 0
     scanned = 0
     sent_count = 0
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}"))
-    status_msg = bot.send_message(admin_chat_id, f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `0`\n📥 Collected: `0`\n📤 Sent: `0`", reply_markup=markup, parse_mode="Markdown")
+    
+    # Update title in options
+    collection_options[task_key]["s_title"] = s_title
+    
+    status_msg = bot.send_message(
+        admin_chat_id, 
+        f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `0`\n📥 Collected: `0`\n📤 Sent: `0 (Hold)`", 
+        reply_markup=get_collection_markup(pair_id), 
+        parse_mode="Markdown"
+    )
     
     try:
         # Force peer resolution (Anti PeerIdInvalid)
@@ -4484,14 +4567,24 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
             collected_messages.append(m)
             collected += 1
             
+            # Update options progress for UI toggle callback
+            opts = collection_options.setdefault(task_key, {})
+            opts.update({
+                "scanned": scanned,
+                "collected": collected,
+                "sent_count": sent_count
+            })
+            curr_instant = opts.get("instant_release", False)
+            
             if scanned % 50 == 0:
                 l_text = f" / {limit}" if limit else ""
+                sent_label = f"`{sent_count}`" if curr_instant else f"`{sent_count} (Hold)`"
                 try:
                     bot.edit_message_text(
-                        f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: `{sent_count}`",
+                        f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: {sent_label}",
                         admin_chat_id,
                         status_msg.message_id,
-                        reply_markup=markup,
+                        reply_markup=get_collection_markup(pair_id),
                         parse_mode="Markdown"
                     )
                 except Exception:
@@ -4537,9 +4630,13 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 bot.send_message(admin_chat_id, f"🛑 Collection forwarding stopped by user.")
                 break
 
-            # Pre-download files safely if the chat is restricted/protected
+            # Read dynamic option for this iteration
+            opts = collection_options.setdefault(task_key, {})
+            curr_instant = opts.get("instant_release", False)
+
+            # Pre-download files safely if the chat is restricted/protected and we are instantly releasing
             downloaded_files = []
-            if is_protected_flow:
+            if curr_instant and is_protected_flow:
                 for msg in batch:
                     if msg.media:
                         try:
@@ -4559,77 +4656,89 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                             logger.error(f"Failed to download media for message {msg.id}: {e}")
 
             try:
-                # 1. Forward directly to target group (Normally)
-                has_media = any(msg.media for msg in batch)
-                if is_protected_flow:
-                    if has_media and not downloaded_files:
-                        logger.warning("🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
+                # 1. Forward directly to target group (Normally) if instant release is active
+                if curr_instant:
+                    has_media = any(msg.media for msg in batch)
+                    if is_protected_flow:
+                        if has_media and not downloaded_files:
+                            logger.warning("🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
+                        else:
+                            await send_mirrored_content(userbot, tid, batch, t_topic, auto_mirror, sid_resolved, pre_downloaded=downloaded_files if has_media else None)
                     else:
-                        await send_mirrored_content(userbot, tid, batch, t_topic, auto_mirror, sid_resolved, pre_downloaded=downloaded_files if has_media else None)
-                else:
-                    await send_mirrored_content(userbot, tid, batch, t_topic, auto_mirror, sid_resolved)
+                        await send_mirrored_content(userbot, tid, batch, t_topic, auto_mirror, sid_resolved)
+                    
+                    sent_count += len(batch)
                 
-                sent_count += len(batch)
-                
-                # 2. Vaulting / Save to database
+                # 2. Save to database
                 for m in batch:
                     m_type = get_specific_media_type(m.media)
                     with db_conn() as conn:
                         c = conn.cursor()
+                        rel_val = 1 if curr_instant else 0
                         if USING_POSTGRES:
                             c.execute(
-                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                                (pair_id, sid_resolved, m.id, m_type, m.message or "")
+                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (%s, %s, %s, %s, %s, 'collection', %s) ON CONFLICT DO NOTHING",
+                                (pair_id, sid_resolved, m.id, m_type, m.message or "", rel_val)
                             )
                         else:
                             c.execute(
-                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                                (pair_id, sid_resolved, m.id, m_type, m.message or "")
+                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (?, ?, ?, ?, ?, 'collection', ?)",
+                                (pair_id, sid_resolved, m.id, m_type, m.message or "", rel_val)
                             )
                 
-                # 3. Send to log bots (through Vault)
-                if is_protected_flow and downloaded_files:
-                    for token, username, bot_id in get_log_bots():
-                        metadata = f"SID: {sid_resolved} | MID: {batch[0].id}\n"
-                        caption_text = metadata + (batch[0].message or "")
-                        try:
-                            vaulted_result = await userbot.send_message(
-                                entity=int(bot_id),
-                                file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
-                                message=caption_text
-                            )
-                            if vaulted_result:
-                                v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
-                                for i, v_m in enumerate(v_msgs):
-                                    orig_m = batch[i]
-                                    save_logged_media(
-                                        bot_id=int(bot_id),
-                                        log_msg_id=int(v_m.id),
-                                        source_chat_id=int(sid_resolved),
-                                        source_msg_id=int(orig_m.id),
-                                        file_id=None,
-                                        media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                                        caption=orig_m.message or "",
-                                        grouped_id=orig_m.grouped_id
-                                    )
-                        except Exception as e:
-                            logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
-                elif not is_protected_flow or not has_media:
-                    asyncio.create_task(forward_to_log_bots(userbot, batch, sid_resolved))
+                # 3. Send to log bots (through Vault) if instant release is active
+                if curr_instant:
+                    has_media = any(msg.media for msg in batch)
+                    if is_protected_flow and downloaded_files:
+                        for token, username, bot_id in get_log_bots():
+                            metadata = f"SID: {sid_resolved} | MID: {batch[0].id}\n"
+                            caption_text = metadata + (batch[0].message or "")
+                            try:
+                                vaulted_result = await userbot.send_message(
+                                    entity=int(bot_id),
+                                    file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
+                                    message=caption_text
+                                )
+                                if vaulted_result:
+                                    v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+                                    for i, v_m in enumerate(v_msgs):
+                                        orig_m = batch[i]
+                                        save_logged_media(
+                                            bot_id=int(bot_id),
+                                            log_msg_id=int(v_m.id),
+                                            source_chat_id=int(sid_resolved),
+                                            source_msg_id=int(orig_m.id),
+                                            file_id=None,
+                                            media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                                            caption=orig_m.message or "",
+                                            grouped_id=orig_m.grouped_id
+                                        )
+                            except Exception as e:
+                                logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                    elif not is_protected_flow or not has_media:
+                        asyncio.create_task(forward_to_log_bots(userbot, batch, sid_resolved))
             finally:
                 for temp_path in downloaded_files:
                     if os.path.exists(temp_path):
                         try: os.remove(temp_path)
                         except Exception: pass
                 
+            # Update progress options for live callback queries
+            opts = collection_options.setdefault(task_key, {})
+            opts.update({
+                "sent_count": sent_count
+            })
+            curr_instant = opts.get("instant_release", False)
+
             # Edit status message
             l_text = f" / {limit}" if limit else ""
+            sent_label = f"`{sent_count}`" if curr_instant else f"`{sent_count} (Hold)`"
             try:
                 bot.edit_message_text(
-                    f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: `{sent_count}`",
+                    f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: {sent_label}",
                     admin_chat_id,
                     status_msg.message_id,
-                    reply_markup=markup,
+                    reply_markup=get_collection_markup(pair_id),
                     parse_mode="Markdown"
                 )
             except Exception:
@@ -4637,11 +4746,15 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 
             await asyncio.sleep(0.5) # Flood wait safety buffer
 
-        bot.send_message(admin_chat_id, f"✅ Collection Done: `{s_title}`\nScanned: `{scanned}`\nCollected & Saved: `{collected}`\nSent to Target: `{sent_count}`")
+        opts = collection_options.setdefault(task_key, {})
+        curr_instant = opts.get("instant_release", False)
+        sent_label = f"Sent to Target: `{sent_count}`" if curr_instant else f"Sent to Target: `{sent_count} (Hold Mode)`"
+        bot.send_message(admin_chat_id, f"✅ Collection Done: `{s_title}`\nScanned: `{scanned}`\nCollected & Saved: `{collected}`\n{sent_label}")
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
     finally:
         running_tasks.pop(task_key, None)
+        collection_options.pop(task_key, None)
 
 async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2):
     is_ok, msg = await ensure_userbot()

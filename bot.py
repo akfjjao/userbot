@@ -4612,7 +4612,7 @@ async def resolve_target_id(client: TelegramClient, target_ref):
 
     raise ValueError(f"Could not find or access chat: {target_ref}")
 
-async def run_collection(admin_chat_id, pair_id, limit=300):
+async def run_collection(admin_chat_id, pair_id, limit=None):
     is_ok, msg = await ensure_userbot()
     if not is_ok:
         bot.send_message(admin_chat_id, f"❌ Userbot error: {msg}")

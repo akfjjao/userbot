@@ -1901,16 +1901,16 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         if m.id in pre_downloaded:
                             files_to_send.append(pre_downloaded[m.id])
                         else:
-                            files_to_send.append(m.media)
+                            files_to_send.append(m)
             elif isinstance(pre_downloaded, list):
                 media_msgs = [m for m in messages if m.media]
                 for idx, m in enumerate(media_msgs):
                     if idx < len(pre_downloaded):
                         files_to_send.append(pre_downloaded[idx])
                     else:
-                        files_to_send.append(m.media)
+                        files_to_send.append(m)
         else:
-            files_to_send = [m.media for m in messages if m.media]
+            files_to_send = [m for m in messages if m.media]
             
         file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
         
@@ -2217,7 +2217,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                         fwd_res = await client(functions.messages.ForwardMessagesRequest(
                             from_peer=src_peer,
                             id=[msg.id for msg in valid_messages],
-                            to_peer=tgt_peer,
+                            to_peer=target_entity,
                             random_id=random_ids,
                             top_msg_id=top_msg_id_val
                         ))

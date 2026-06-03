@@ -1185,6 +1185,24 @@ def get_collection_markup(pair_id):
     markup.row(btn_stop, btn_toggle)
     return markup
 
+release_options = {} # Track release options: { "pid_source_type": "everything"/"media"/"text" }
+
+def get_release_markup(pid, source_type):
+    key = f"{pid}_{source_type}"
+    curr_filter = release_options.setdefault(key, "everything")
+    
+    cf_map = {"everything": "🔄 All Content", "media": "🖼️ Media Only", "text": "📝 Text Only"}
+    cf_text = cf_map.get(curr_filter, "🔄 All Content")
+    
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(InlineKeyboardButton(f"Release Filter: {cf_text}", callback_data=f"pair_rel_filter_{source_type}_{pid}"))
+    markup.add(
+        InlineKeyboardButton("⚡ Instant Release", callback_data=f"pair_rel_now_{source_type}_{pid}"),
+        InlineKeyboardButton("⏰ Scheduled (Slow)", callback_data=f"pair_rel_slow_{source_type}_{pid}")
+    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"pair_release_{pid}"))
+    return markup
+
 def stop_task(task_key):
     if task_key in running_tasks:
         running_tasks[task_key] = False
@@ -3885,24 +3903,44 @@ def handle_callbacks(call):
         pid = int(parts[4])
         bot.answer_callback_query(call.id)
         
-        markup = InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            InlineKeyboardButton("⚡ Instant Release", callback_data=f"pair_rel_now_{source_type}_{pid}"),
-            InlineKeyboardButton("⏰ Scheduled (Slow)", callback_data=f"pair_rel_slow_{source_type}_{pid}")
-        )
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"pair_release_{pid}"))
-        
         m_names = {"monitor": "Monitor 👁️", "scraper": "History Scraper 📜", "collection": "Collect Now 📥"}
         display_name = m_names.get(source_type, "Vault Items")
-        bot.edit_message_text(f"🚀 *Release Engine: {display_name}*\n\nChoose release mode:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        bot.edit_message_text(f"🚀 *Release Engine: {display_name}*\n\nChoose release mode:", call.message.chat.id, call.message.message_id, reply_markup=get_release_markup(pid, source_type), parse_mode="Markdown")
+
+    elif data.startswith("pair_rel_filter_"):
+        parts = data.split("_")
+        # Structure: pair_rel_filter_{source_type}_{pid}
+        source_type = parts[3]
+        pid = int(parts[4])
+        
+        key = f"{pid}_{source_type}"
+        current = release_options.setdefault(key, "everything")
+        next_filter = "media" if current == "everything" else "text" if current == "media" else "everything"
+        release_options[key] = next_filter
+        
+        bot.answer_callback_query(call.id, f"🎯 Release Filter: {next_filter.title()}")
+        
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=get_release_markup(pid, source_type)
+            )
+        except Exception as e:
+            logger.error(f"Error updating release markup: {e}")
 
     elif data.startswith("pair_rel_now_"):
         parts = data.split("_")
         # Structure: pair_rel_now_{source_type}_{pid}
         source_type = parts[3]
         pid = int(parts[4])
+        
+        # Get chosen release filter
+        key = f"{pid}_{source_type}"
+        release_filter = release_options.get(key, "everything")
+        
         bot.answer_callback_query(call.id, f"🚀 Starting Instant Release...")
-        asyncio.run_coroutine_threadsafe(run_release(call.message.chat.id, pid, added_by=source_type, interval=1.5), loop)
+        asyncio.run_coroutine_threadsafe(run_release(call.message.chat.id, pid, added_by=source_type, interval=1.5, release_filter=release_filter), loop)
         asyncio.run_coroutine_threadsafe(show_pair_view(call.message.chat.id, call.message.message_id, pid), loop)
 
     elif data.startswith("pair_rel_slow_"):
@@ -3910,8 +3948,13 @@ def handle_callbacks(call):
         # Structure: pair_rel_slow_{source_type}_{pid}
         source_type = parts[3]
         pid = int(parts[4])
+        
+        # Get chosen release filter
+        key = f"{pid}_{source_type}"
+        release_filter = release_options.get(key, "everything")
+        
         bot.answer_callback_query(call.id)
-        admin_states[uid] = f"rel_src_setup_interval_{source_type}_{pid}"
+        admin_states[uid] = f"rel_src_setup_interval_{source_type}_{pid}_{release_filter}"
         bot.send_message(call.message.chat.id, "⏰ *Slow Release Setup*\n\nEnter the *interval* between items in seconds:\n(Example: `60` for 1 minute, `300` for 5 minutes)")
     elif data.startswith("pair_delete_confirm_"):
         pid = int(data.split("_")[-1])
@@ -4183,10 +4226,14 @@ def handle_state_inputs(message):
         asyncio.run_coroutine_threadsafe(verify_password_task(), loop)
 
     elif state.startswith("rel_src_setup_interval_"):
-        # Format: rel_src_setup_interval_{source_type}_{pid}
+        # Format: rel_src_setup_interval_{source_type}_{pid}_{filter}
         parts = state.split("_")
         source_type = parts[4]
         pid = int(parts[5])
+        release_filter = "everything"
+        if len(parts) > 6:
+            release_filter = parts[6]
+            
         if not text.isdigit():
             bot.reply_to(message, "Please send a valid number.")
             return
@@ -4196,16 +4243,20 @@ def handle_state_inputs(message):
         m_names = {"monitor": "Monitoring", "scraper": "History Scraper", "collection": "Collect Now"}
         display_name = m_names.get(source_type, "Vault Items")
         
+        f_names = {"everything": "All Content 🔄", "media": "Media Only 🖼️", "text": "Text Only 📝"}
+        display_filter = f_names.get(release_filter, "All Content 🔄")
+        
         bot.send_message(
             message.chat.id, 
             f"⏳ **Slow Release Initiated**\n\n"
             f"🎯 **Target Pair ID:** `{pid}`\n"
             f"📥 **Collection Source:** `{display_name}`\n"
+            f"🎯 **Release Filter:** `{display_filter}`\n"
             f"⏰ **Release Interval:** `{interval}s` between items\n\n"
             f"🚀 *Engine running in background...*",
             parse_mode="Markdown"
         )
-        asyncio.run_coroutine_threadsafe(run_release(message.chat.id, pid, added_by=source_type, interval=interval), loop)
+        asyncio.run_coroutine_threadsafe(run_release(message.chat.id, pid, added_by=source_type, interval=interval, release_filter=release_filter), loop)
     elif state.startswith("hist_setup_count_only_"):
         pid = int(state.split("_")[-1])
         if not text.isdigit():
@@ -4756,7 +4807,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
         running_tasks.pop(task_key, None)
         collection_options.pop(task_key, None)
 
-async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2):
+async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, release_filter="everything"):
     is_ok, msg = await ensure_userbot()
     if not is_ok:
         bot.send_message(admin_chat_id, f"❌ Userbot error: {msg}")
@@ -4809,7 +4860,10 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2):
         sent = 0
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{added_by}_{pair_id}" if added_by else f"pair_stop_task_rel_{pair_id}"))
-        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items from {category_name}...", reply_markup=markup)
+        
+        f_names = {"everything": "All Content 🔄", "media": "Media Only 🖼️", "text": "Text Only 📝"}
+        display_filter = f_names.get(release_filter, "All Content 🔄")
+        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items from {category_name}...\n🎯 Filter: `{display_filter}`", reply_markup=markup)
         
         for row_id, smid in items:
             if not running_tasks.get(task_key): break
@@ -4832,6 +4886,14 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2):
                         c = conn.cursor()
                         p = get_placeholder()
                         c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                    continue
+
+                # --- DYNAMIC RELEASE FILTERING ---
+                # Check message against dynamic release filter: if it doesn't match, we skip
+                # sending but keep it in the database as unreleased (released = 0) for future release runs.
+                if release_filter == "media" and not msg.media:
+                    continue
+                if release_filter == "text" and msg.media:
                     continue
 
                 target_topic_anchor = t_topic
@@ -4982,13 +5044,13 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2):
                         c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
                 sent += 1
                 if sent % 5 == 0:
-                    try: bot.edit_message_text(f"🚀 Releasing `{s_title}` ({category_name})...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
+                    try: bot.edit_message_text(f"🚀 Releasing `{s_title}` ({category_name})...\n🎯 Filter: `{display_filter}`\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
                     except Exception: pass
                 await asyncio.sleep(interval)
             except Exception as e:
                 logger.error(f"Release error: {e}")
 
-        bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items from {category_name}.")
+        bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items from {category_name} matching `{display_filter}`.")
     except Exception as e:
         logger.error(f"Global Release Error: {e}")
         bot.send_message(admin_chat_id, f"❌ Release Crashed: {e}")

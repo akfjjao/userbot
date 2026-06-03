@@ -4656,21 +4656,21 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 break
 
             # Pre-download files safely if the chat is restricted/protected
-            downloaded_files = []
+            media_to_file = {}
             if is_protected_flow:
                 for msg in batch:
                     if msg.media:
                         try:
                             path = await userbot.download_media(msg)
                             if path:
-                                downloaded_files.append(path)
+                                media_to_file[msg.id] = path
                         except errors.FloodWaitError as fwe:
                             logger.warning(f"⏳ SCRAPE FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
                             if fwe.seconds <= 5:
                                 await asyncio.sleep(fwe.seconds)
                                 try:
                                     path = await userbot.download_media(msg)
-                                    if path: downloaded_files.append(path)
+                                    if path: media_to_file[msg.id] = path
                                 except Exception as e2:
                                     logger.error(f"Failed to download media after short flood wait: {e2}")
                         except Exception as e:
@@ -4680,10 +4680,10 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 # Forward directly to target group
                 has_media = any(msg.media for msg in batch)
                 if is_protected_flow:
-                    if has_media and not downloaded_files:
+                    if has_media and not any(msg.id in media_to_file for msg in batch):
                         logger.warning("🛡️ SCRAPE: Skipping mirror because media download failed/skipped.")
                     else:
-                        await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved, pre_downloaded=downloaded_files if has_media else None)
+                        await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved, pre_downloaded=[media_to_file[msg.id] for msg in batch if msg.id in media_to_file] if (is_protected_flow and has_media) else None)
                 else:
                     await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved)
                 
@@ -4691,52 +4691,79 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 
                 # Vaulting / Log bots logic if enabled
                 if is_mon:
-                    for m in batch:
-                        if m.media:
-                            m_type = type(m.media).__name__
-                            with db_conn() as conn:
-                                c = conn.cursor()
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        for m in batch:
+                            if m.media:
+                                m_type = type(m.media).__name__
                                 if USING_POSTGRES:
                                     c.execute(
-                                        "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (%s, %s, %s, %s, %s, 'scraper', 1) ON CONFLICT DO NOTHING",
+                                        """
+                                        INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) 
+                                        VALUES (%s, %s, %s, %s, %s, 'scraper', 1) 
+                                        ON CONFLICT (source_chat_id, source_message_id) 
+                                        DO UPDATE SET 
+                                            pair_id = EXCLUDED.pair_id,
+                                            media_type = EXCLUDED.media_type,
+                                            caption = EXCLUDED.caption,
+                                            added_by = EXCLUDED.added_by,
+                                            released = EXCLUDED.released,
+                                            timestamp = CURRENT_TIMESTAMP
+                                        """,
                                         (pair_id, sid_resolved, m.id, m_type, m.message or "")
                                     )
                                 else:
                                     c.execute(
-                                        "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (?, ?, ?, ?, ?, 'scraper', 1)",
+                                        """
+                                        INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) 
+                                        VALUES (?, ?, ?, ?, ?, 'scraper', 1) 
+                                        ON CONFLICT (source_chat_id, source_message_id) 
+                                        DO UPDATE SET 
+                                            pair_id = excluded.pair_id,
+                                            media_type = excluded.media_type,
+                                            caption = excluded.caption,
+                                            added_by = excluded.added_by,
+                                            released = excluded.released,
+                                            timestamp = datetime('now')
+                                        """,
                                         (pair_id, sid_resolved, m.id, m_type, m.message or "")
                                     )
+                        if not USING_POSTGRES or not DATABASE_URL:
+                            conn.commit()
                     
-                    if is_protected_flow and downloaded_files:
-                        for token, username, bot_id in get_log_bots():
-                            metadata = f"SID: {sid_resolved} | MID: {batch[0].id}\n"
-                            caption_text = metadata + (batch[0].message or "")
-                            try:
-                                vaulted_result = await userbot.send_message(
-                                    entity=int(bot_id),
-                                    file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
-                                    message=caption_text
-                                )
-                                if vaulted_result:
-                                    v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
-                                    for i, v_m in enumerate(v_msgs):
-                                        orig_m = batch[i]
-                                        save_logged_media(
-                                            bot_id=int(bot_id),
-                                            log_msg_id=int(v_m.id),
-                                            source_chat_id=int(sid_resolved),
-                                            source_msg_id=int(orig_m.id),
-                                            file_id=None,
-                                            media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                                            caption=orig_m.message or "",
-                                            grouped_id=orig_m.grouped_id
-                                        )
-                            except Exception as e:
-                                logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
-                    elif not is_protected_flow or not has_media:
+                    if is_protected_flow:
+                        files_to_vault = [media_to_file.get(m.id) for m in batch if m.id in media_to_file]
+                        if files_to_vault:
+                            file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
+                            for token, username, bot_id in get_log_bots():
+                                metadata = f"SID: {sid_resolved} | MID: {batch[0].id}\n"
+                                caption_text = metadata + (batch[0].message or "")
+                                try:
+                                    vaulted_result = await userbot.send_message(
+                                        entity=int(bot_id),
+                                        file=file_payload,
+                                        message=caption_text
+                                    )
+                                    if vaulted_result:
+                                        v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+                                        for i, v_m in enumerate(v_msgs):
+                                            orig_m = batch[i]
+                                            save_logged_media(
+                                                bot_id=int(bot_id),
+                                                log_msg_id=int(v_m.id),
+                                                source_chat_id=int(sid_resolved),
+                                                source_msg_id=int(orig_m.id),
+                                                file_id=None,
+                                                media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                                                caption=orig_m.message or "",
+                                                grouped_id=orig_m.grouped_id
+                                            )
+                                except Exception as e:
+                                    logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                    else:
                         asyncio.create_task(forward_to_log_bots(userbot, batch, sid_resolved))
             finally:
-                for temp_path in downloaded_files:
+                for temp_path in media_to_file.values():
                     if os.path.exists(temp_path):
                         try: os.remove(temp_path)
                         except Exception: pass
@@ -4972,25 +4999,23 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     
                 if matches:
                     matching_batch.append(msg)
-                else:
-                    skipped_batch.append(msg)
 
             # Pre-download files safely if the chat is restricted/protected and we are instantly releasing
-            downloaded_files = []
+            media_to_file = {}
             if curr_instant and is_protected_flow and matching_batch:
                 for msg in matching_batch:
                     if msg.media:
                         try:
                             path = await userbot.download_media(msg)
                             if path:
-                                downloaded_files.append(path)
+                                media_to_file[msg.id] = path
                         except errors.FloodWaitError as fwe:
                             logger.warning(f"⏳ COLLECTION FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
                             if fwe.seconds <= 5:
                                 await asyncio.sleep(fwe.seconds)
                                 try:
                                     path = await userbot.download_media(msg)
-                                    if path: downloaded_files.append(path)
+                                    if path: media_to_file[msg.id] = path
                                 except Exception as e2:
                                     logger.error(f"Failed to download media after short flood wait: {e2}")
                         except Exception as e:
@@ -5001,75 +5026,101 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 if curr_instant and matching_batch:
                     has_media = any(msg.media for msg in matching_batch)
                     if is_protected_flow:
-                        if has_media and not downloaded_files:
+                        if has_media and not any(msg.id in media_to_file for msg in matching_batch):
                             logger.warning("🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
                         else:
-                            await send_mirrored_content(userbot, tid_resolved, matching_batch, t_topic, auto_mirror, sid_resolved, pre_downloaded=downloaded_files if has_media else None)
+                            await send_mirrored_content(userbot, tid_resolved, matching_batch, t_topic, auto_mirror, sid_resolved, pre_downloaded=[media_to_file[msg.id] for msg in matching_batch if msg.id in media_to_file] if (is_protected_flow and has_media) else None)
                     else:
                         await send_mirrored_content(userbot, tid_resolved, matching_batch, t_topic, auto_mirror, sid_resolved)
                     
                     sent_count += len(matching_batch)
                 
                 # 2. Save to database
-                for m in batch:
-                    m_type = get_specific_media_type(m.media)
-                    # Determine release status for this specific message
-                    if curr_instant:
-                        matches = True
-                        if instant_filter == "media" and not m.media:
-                            matches = False
-                        elif instant_filter == "text" and m.media:
-                            matches = False
-                        rel_val = 1 if matches else 0
-                    else:
-                        rel_val = 0
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    for m in batch:
+                        m_type = get_specific_media_type(m.media)
+                        # Determine release status for this specific message
+                        if curr_instant:
+                            matches = True
+                            if instant_filter == "media" and not m.media:
+                                matches = False
+                            elif instant_filter == "text" and m.media:
+                                matches = False
+                            rel_val = 1 if matches else 0
+                        else:
+                            rel_val = 0
 
-                    with db_conn() as conn:
-                        c = conn.cursor()
                         if USING_POSTGRES:
                             c.execute(
-                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (%s, %s, %s, %s, %s, 'collection', %s) ON CONFLICT DO NOTHING",
+                                """
+                                INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) 
+                                VALUES (%s, %s, %s, %s, %s, 'collection', %s) 
+                                ON CONFLICT (source_chat_id, source_message_id) 
+                                DO UPDATE SET 
+                                    pair_id = EXCLUDED.pair_id,
+                                    media_type = EXCLUDED.media_type,
+                                    caption = EXCLUDED.caption,
+                                    added_by = EXCLUDED.added_by,
+                                    released = EXCLUDED.released,
+                                    timestamp = CURRENT_TIMESTAMP
+                                """,
                                 (pair_id, sid_resolved, m.id, m_type, m.message or "", rel_val)
                             )
                         else:
                             c.execute(
-                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (?, ?, ?, ?, ?, 'collection', ?)",
+                                """
+                                INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) 
+                                VALUES (?, ?, ?, ?, ?, 'collection', ?) 
+                                ON CONFLICT (source_chat_id, source_message_id) 
+                                DO UPDATE SET 
+                                    pair_id = excluded.pair_id,
+                                    media_type = excluded.media_type,
+                                    caption = excluded.caption,
+                                    added_by = excluded.added_by,
+                                    released = excluded.released,
+                                    timestamp = datetime('now')
+                                """,
                                 (pair_id, sid_resolved, m.id, m_type, m.message or "", rel_val)
                             )
-                
+                    if not USING_POSTGRES or not DATABASE_URL:
+                        conn.commit()
                 # 3. Send to log bots (through Vault) if instant release is active and matching_batch exists
                 if curr_instant and matching_batch:
                     has_media = any(msg.media for msg in matching_batch)
-                    if is_protected_flow and downloaded_files:
-                        for token, username, bot_id in get_log_bots():
-                            metadata = f"SID: {sid_resolved} | MID: {matching_batch[0].id}\n"
-                            caption_text = metadata + (matching_batch[0].message or "")
-                            try:
-                                vaulted_result = await userbot.send_message(
-                                    entity=int(bot_id),
-                                    file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
-                                    message=caption_text
-                                )
-                                if vaulted_result:
-                                    v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
-                                    for i, v_m in enumerate(v_msgs):
-                                        orig_m = matching_batch[i]
-                                        save_logged_media(
-                                            bot_id=int(bot_id),
-                                            log_msg_id=int(v_m.id),
-                                            source_chat_id=int(sid_resolved),
-                                            source_msg_id=int(orig_m.id),
-                                            file_id=None,
-                                            media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                                            caption=orig_m.message or "",
-                                            grouped_id=orig_m.grouped_id
-                                        )
-                            except Exception as e:
-                                logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
-                    elif not is_protected_flow or not has_media:
+                    if is_protected_flow:
+                        files_to_vault = [media_to_file.get(m.id) for m in matching_batch if m.id in media_to_file]
+                        if files_to_vault:
+                            file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
+                            for token, username, bot_id in get_log_bots():
+                                metadata = f"SID: {sid_resolved} | MID: {matching_batch[0].id}\n"
+                                caption_text = metadata + (matching_batch[0].message or "")
+                                try:
+                                    vaulted_result = await userbot.send_message(
+                                        entity=int(bot_id),
+                                        file=file_payload,
+                                        message=caption_text
+                                    )
+                                    if vaulted_result:
+                                        v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+                                        for i, v_m in enumerate(v_msgs):
+                                            orig_m = matching_batch[i]
+                                            save_logged_media(
+                                                bot_id=int(bot_id),
+                                                log_msg_id=int(v_m.id),
+                                                source_chat_id=int(sid_resolved),
+                                                source_msg_id=int(orig_m.id),
+                                                file_id=None,
+                                                media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                                                caption=orig_m.message or "",
+                                                grouped_id=orig_m.grouped_id
+                                            )
+                                except Exception as e:
+                                    logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                    else:
                         asyncio.create_task(forward_to_log_bots(userbot, matching_batch, sid_resolved))
             finally:
-                for temp_path in downloaded_files:
+                for temp_path in media_to_file.values():
                     if os.path.exists(temp_path):
                         try: os.remove(temp_path)
                         except Exception: pass

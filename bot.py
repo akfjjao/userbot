@@ -1784,6 +1784,34 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
     except Exception as e:
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
 
+def update_telethon_entity_cache(client, peer):
+    """Safely and dynamically updates Telethon's internal entity caches."""
+    if not peer:
+        return
+    try:
+        if hasattr(client, '_entity_cache'):
+            cache = client._entity_cache
+            if hasattr(cache, 'add'):
+                cache.add(peer)
+            elif hasattr(cache, 'extend'):
+                cache.extend([], [peer])
+            elif isinstance(cache, dict):
+                cache[peer.id] = peer
+    except Exception as e:
+        logger.error(f"Failed to update client._entity_cache: {e}")
+
+    try:
+        if hasattr(client, '_mb_entity_cache'):
+            mb_cache = client._mb_entity_cache
+            if hasattr(mb_cache, 'extend'):
+                mb_cache.extend([], [peer])
+            elif hasattr(mb_cache, 'add'):
+                mb_cache.add(peer)
+            elif isinstance(mb_cache, dict):
+                mb_cache[peer.id] = peer
+    except Exception as e:
+        logger.error(f"Failed to update client._mb_entity_cache: {e}")
+
 async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid, pre_downloaded=None):
     """Unified Hub for mirrored sending with native Forum Topic support."""
     downloaded_files = []
@@ -1851,10 +1879,26 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
         sent = None
         
         # Determine the file/media to send
+        files_to_send = []
         if pre_downloaded:
-            file_to_send = pre_downloaded if len(pre_downloaded) > 1 else pre_downloaded[0]
+            if isinstance(pre_downloaded, dict):
+                for m in messages:
+                    if m.media:
+                        if m.id in pre_downloaded:
+                            files_to_send.append(pre_downloaded[m.id])
+                        else:
+                            files_to_send.append(m.media)
+            elif isinstance(pre_downloaded, list):
+                media_msgs = [m for m in messages if m.media]
+                for idx, m in enumerate(media_msgs):
+                    if idx < len(pre_downloaded):
+                        files_to_send.append(pre_downloaded[idx])
+                    else:
+                        files_to_send.append(m.media)
         else:
-            file_to_send = [m.media for m in messages] if len(messages) > 1 else messages[0].media
+            files_to_send = [m.media for m in messages if m.media]
+            
+        file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
         
         for attempt in range(3):
             try:
@@ -2038,10 +2082,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                     fresh_peer = res.chats[0]
                     is_protected_flow = getattr(fresh_peer, 'noforwards', False)
                     # Correctly bind the structural entity metadata to Telethon's internal maps
-                    if hasattr(client, '_entity_cache') and hasattr(client._entity_cache, 'add'):
-                        client._entity_cache.add(fresh_peer)
-                    elif hasattr(client, '_mb_entity_cache'):
-                        client._mb_entity_cache.extend([], [fresh_peer])
+                    update_telethon_entity_cache(client, fresh_peer)
             else:
                 is_protected_flow = getattr(chat_peer, 'noforwards', False)
     except Exception as e:
@@ -2097,8 +2138,6 @@ async def process_automation_pipeline(client, messages, source_chat_id):
             if not valid_messages:
                 continue
 
-            pair_downloaded = [media_to_file[m.id] for m in valid_messages if m.id in media_to_file]
-
             # Execution Step A: Database Logging Operations
             if is_mon:
                 with db_conn() as conn:
@@ -2122,10 +2161,10 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                 is_reply = any(getattr(msg, 'reply_to_msg_id', None) for msg in valid_messages)
                 if is_protected_flow or is_reply:
                     has_media = any(m.media for m in valid_messages)
-                    if is_protected_flow and has_media and not pair_downloaded:
+                    if is_protected_flow and has_media and not any(m.id in media_to_file for m in valid_messages):
                         logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} (Download Failed).")
                     else:
-                        await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid, pre_downloaded=pair_downloaded if has_media else None)
+                        await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid, pre_downloaded=media_to_file if has_media else None)
                 else:
                     # Unrestricted flow: perform standard native forward safely
                     try:
@@ -2193,14 +2232,16 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                 if is_protected_flow:
                     has_media = any(m.media for m in valid_messages)
                     if has_media:
-                        if pair_downloaded:
+                        files_to_vault = [media_to_file.get(m.id) or m.media for m in valid_messages if m.media]
+                        if files_to_vault:
+                            file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
                             for token, username, bot_id in get_log_bots():
                                 metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
                                 caption_text = metadata + (first_msg.message or "")
                                 try:
                                     vaulted_result = await client.send_message(
                                         entity=int(bot_id),
-                                        file=pair_downloaded if len(pair_downloaded) > 1 else pair_downloaded[0],
+                                        file=file_payload,
                                         message=caption_text
                                     )
                                     if vaulted_result:
@@ -4604,7 +4645,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 if res and res.chats:
                     target_chat = res.chats[0]
                     is_protected_flow = getattr(target_chat, 'noforwards', False)
-                    userbot._entity_cache.add(target_chat)
+                    update_telethon_entity_cache(userbot, target_chat)
             except Exception:
                 pass
 
@@ -4903,7 +4944,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 if res and res.chats:
                     source_chat = res.chats[0]
                     is_protected_flow = getattr(source_chat, 'noforwards', False)
-                    userbot._entity_cache.add(source_chat)
+                    update_telethon_entity_cache(userbot, source_chat)
             except Exception:
                 pass
 

@@ -2026,6 +2026,17 @@ async def process_automation_pipeline(client, messages, source_chat_id):
     try:
         chat_peer = await client.get_entity(source_chat_id)
         is_protected_flow = getattr(chat_peer, 'noforwards', False)
+        if is_protected_flow:
+            # Stale cache check: force fetch from network to verify if it is still restricted
+            try:
+                from telethon.tl.functions.channels import GetChannelsRequest
+                res = await client(GetChannelsRequest(id=[chat_peer]))
+                if res and res.chats:
+                    fresh_peer = res.chats[0]
+                    is_protected_flow = getattr(fresh_peer, 'noforwards', False)
+                    client._entity_cache.add(fresh_peer)
+            except Exception as cache_err:
+                logger.debug(f"Failed to refresh stale entity cache for {source_chat_id}: {cache_err}")
     except Exception as e:
         logger.error(f"Failed to check noforwards for chat {source_chat_id}: {e}")
         is_protected_flow = False
@@ -4579,6 +4590,16 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
 
         # Check if protected flow
         is_protected_flow = getattr(target_chat, 'noforwards', False)
+        if is_protected_flow:
+            try:
+                from telethon.tl.functions.channels import GetChannelsRequest
+                res = await userbot(GetChannelsRequest(id=[target_chat]))
+                if res and res.chats:
+                    target_chat = res.chats[0]
+                    is_protected_flow = getattr(target_chat, 'noforwards', False)
+                    userbot._entity_cache.add(target_chat)
+            except Exception:
+                pass
 
         # Forward the batches chronologically to the target group and vault them if needed
         for batch in grouped_batches:
@@ -4868,6 +4889,16 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
 
         # Check if protected flow
         is_protected_flow = getattr(source_chat, 'noforwards', False)
+        if is_protected_flow:
+            try:
+                from telethon.tl.functions.channels import GetChannelsRequest
+                res = await userbot(GetChannelsRequest(id=[source_chat]))
+                if res and res.chats:
+                    source_chat = res.chats[0]
+                    is_protected_flow = getattr(source_chat, 'noforwards', False)
+                    userbot._entity_cache.add(source_chat)
+            except Exception:
+                pass
 
         # Save and forward both normally and through vault
         for batch in grouped_batches:

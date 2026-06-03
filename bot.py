@@ -1173,12 +1173,28 @@ collection_options = {} # Track collection options for active tasks: { "coll_1":
 
 def get_collection_markup(pair_id):
     task_key = f"coll_{pair_id}"
-    options = collection_options.setdefault(task_key, {"instant_release": False, "instant_filter": "everything"})
+    options = collection_options.setdefault(task_key, {
+        "instant_release": False,
+        "instant_filter": "everything",
+        "collect_filter": "everything"
+    })
     instant_release = options.get("instant_release", False)
     instant_filter = options.get("instant_filter", "everything")
+    collect_filter = options.get("collect_filter", "everything")
     
     markup = InlineKeyboardMarkup()
     btn_stop = InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}")
+    
+    # Collect filter button
+    col_map = {
+        "everything": "🔄 All Content",
+        "media": "🖼️ Media Only",
+        "text": "📝 Text Only",
+        "file": "📁 Files Only"
+    }
+    col_text = col_map.get(collect_filter, "🔄 All Content")
+    btn_collect_filter = InlineKeyboardButton(f"Collect: {col_text}", callback_data=f"pair_coll_cfilter_{pair_id}")
+    
     if instant_release:
         btn_toggle = InlineKeyboardButton("📥 Hold Release", callback_data=f"pair_coll_toggle_{pair_id}_hold")
         
@@ -1187,10 +1203,11 @@ def get_collection_markup(pair_id):
         btn_filter = InlineKeyboardButton(f"Filter: {cf_text}", callback_data=f"pair_coll_filter_{pair_id}")
         
         markup.row(btn_stop, btn_toggle)
-        markup.row(btn_filter)
+        markup.row(btn_collect_filter, btn_filter)
     else:
         btn_toggle = InlineKeyboardButton("⚡ Instant Release", callback_data=f"pair_coll_toggle_{pair_id}_instant")
         markup.row(btn_stop, btn_toggle)
+        markup.row(btn_collect_filter)
     return markup
 
 release_options = {} # Track release options: { "pid_source_type": "everything"/"media"/"text" }
@@ -3948,6 +3965,59 @@ def handle_callbacks(call):
             except Exception as e:
                 logger.error(f"Error editing reply markup in filter callback: {e}")
 
+    elif data.startswith("pair_coll_cfilter_"):
+        pid = int(data.split("_")[-1])
+        task_key = f"coll_{pid}"
+        
+        # Check if task is running
+        if task_key not in running_tasks or not running_tasks[task_key]:
+            bot.answer_callback_query(call.id, "❌ Collection is not currently running.")
+            return
+            
+        opts = collection_options.setdefault(task_key, {})
+        current = opts.get("collect_filter", "everything")
+        # Cycle through: everything -> media -> text -> file -> everything
+        next_filter = "media" if current == "everything" else "text" if current == "media" else "file" if current == "text" else "everything"
+        opts["collect_filter"] = next_filter
+        
+        bot.answer_callback_query(call.id, f"📥 Collect Filter: {next_filter.title()}")
+        
+        # Reconstruct the message text using saved states if available
+        if "s_title" in opts:
+            s_title = opts["s_title"]
+            scanned = opts["scanned"]
+            collected = opts["collected"]
+            limit = opts["limit"]
+            sent_count = opts["sent_count"]
+            curr_instant = opts.get("instant_release", False)
+            curr_filter = opts.get("instant_filter", "everything")
+            
+            l_text = f" / {limit}" if limit else ""
+            sent_label = f"`{sent_count}`" if curr_instant else f"`{sent_count} (Hold)`"
+            if curr_instant:
+                f_map = {"everything": "All", "media": "Media Only", "text": "Text Only"}
+                sent_label += f" ({f_map.get(curr_filter, 'All')})"
+            
+            try:
+                bot.edit_message_text(
+                    f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: {sent_label}",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=get_collection_markup(pid),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Error editing message text in collect filter callback: {e}")
+        else:
+            try:
+                bot.edit_message_reply_markup(
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=get_collection_markup(pid)
+                )
+            except Exception as e:
+                logger.error(f"Error editing reply markup in collect filter callback: {e}")
+
     elif data.startswith("pair_release_"):
         pid = int(data.split("_")[-1])
         bot.answer_callback_query(call.id)
@@ -4621,17 +4691,6 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
     task_key = f"coll_{pair_id}"
     running_tasks[task_key] = True
     
-    # Initialize collection options default state
-    collection_options[task_key] = {
-        "instant_release": False,
-        "instant_filter": "everything",
-        "s_title": "Source",
-        "scanned": 0,
-        "collected": 0,
-        "limit": limit,
-        "sent_count": 0
-    }
-    
     row = get_target_pair(pair_id)
     if not row: return
     # Unpack 11 fields including cf (content_filter)
@@ -4640,8 +4699,21 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
     scanned = 0
     sent_count = 0
     
-    # Update title in options
-    collection_options[task_key]["s_title"] = s_title
+    default_cf = cf or "everything"
+    if default_cf not in ["everything", "media", "text", "file"]:
+        default_cf = "everything"
+        
+    # Initialize collection options default state
+    collection_options[task_key] = {
+        "instant_release": False,
+        "instant_filter": "everything",
+        "collect_filter": default_cf,
+        "s_title": s_title,
+        "scanned": 0,
+        "collected": 0,
+        "limit": limit,
+        "sent_count": 0
+    }
     
     status_msg = bot.send_message(
         admin_chat_id, 
@@ -4680,11 +4752,16 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
             if is_user_banned(sender_id, sender_username):
                 continue
 
-            # Content type filter
-            cf_val = cf or "everything"
-            if cf_val == "media" and not m.media:
+            # Content type filter (dynamic based on collect_filter option)
+            opts_current = collection_options.get(task_key, {})
+            cf_val = opts_current.get("collect_filter", "everything")
+            
+            m_type = get_specific_media_type(m.media)
+            if cf_val == "media" and m_type not in ["photo", "video"]:
                 continue
-            if cf_val == "text" and m.media:
+            if cf_val == "text" and m_type != "text":
+                continue
+            if cf_val == "file" and m_type != "file":
                 continue
 
             collected_messages.append(m)

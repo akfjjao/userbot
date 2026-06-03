@@ -1884,7 +1884,7 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                     for m in messages:
                         if m.media:
                             try:
-                                path = await client.download_media(m.media)
+                                path = await client.download_media(m)
                                 if path:
                                     downloaded_files.append(path)
                             except Exception as de:
@@ -2035,7 +2035,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
         for msg in messages:
             if msg.media:
                 try:
-                    path = await client.download_media(msg.media)
+                    path = await client.download_media(msg)
                     if path:
                         downloaded_files.append(path)
                 except errors.FloodWaitError as fwe:
@@ -2043,7 +2043,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                     if fwe.seconds <= 5:
                         await asyncio.sleep(fwe.seconds)
                         try:
-                            path = await client.download_media(msg.media)
+                            path = await client.download_media(msg)
                             if path:
                                 downloaded_files.append(path)
                         except Exception as e2:
@@ -2261,7 +2261,7 @@ def setup_automation_handlers(client: TelegramClient):
                         if allow_destructive:
                             try:
                                 # Standard forward is blocked by server, so we decrypt and download locally first
-                                temp_path = await client.download_media(m.media)
+                                temp_path = await client.download_media(m)
                                 if temp_path:
                                     for tid in target_ids:
                                         try:
@@ -4592,7 +4592,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 for msg in batch:
                     if msg.media:
                         try:
-                            path = await userbot.download_media(msg.media)
+                            path = await userbot.download_media(msg)
                             if path:
                                 downloaded_files.append(path)
                         except errors.FloodWaitError as fwe:
@@ -4600,7 +4600,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                             if fwe.seconds <= 5:
                                 await asyncio.sleep(fwe.seconds)
                                 try:
-                                    path = await userbot.download_media(msg.media)
+                                    path = await userbot.download_media(msg)
                                     if path: downloaded_files.append(path)
                                 except Exception as e2:
                                     logger.error(f"Failed to download media after short flood wait: {e2}")
@@ -4902,7 +4902,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 for msg in matching_batch:
                     if msg.media:
                         try:
-                            path = await userbot.download_media(msg.media)
+                            path = await userbot.download_media(msg)
                             if path:
                                 downloaded_files.append(path)
                         except errors.FloodWaitError as fwe:
@@ -4910,7 +4910,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                             if fwe.seconds <= 5:
                                 await asyncio.sleep(fwe.seconds)
                                 try:
-                                    path = await userbot.download_media(msg.media)
+                                    path = await userbot.download_media(msg)
                                     if path: downloaded_files.append(path)
                                 except Exception as e2:
                                     logger.error(f"Failed to download media after short flood wait: {e2}")

@@ -1173,16 +1173,24 @@ collection_options = {} # Track collection options for active tasks: { "coll_1":
 
 def get_collection_markup(pair_id):
     task_key = f"coll_{pair_id}"
-    options = collection_options.setdefault(task_key, {"instant_release": False})
+    options = collection_options.setdefault(task_key, {"instant_release": False, "instant_filter": "everything"})
     instant_release = options.get("instant_release", False)
+    instant_filter = options.get("instant_filter", "everything")
     
     markup = InlineKeyboardMarkup()
     btn_stop = InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}")
     if instant_release:
         btn_toggle = InlineKeyboardButton("📥 Hold Release", callback_data=f"pair_coll_toggle_{pair_id}_hold")
+        
+        cf_map = {"everything": "🔄 All Content", "media": "🖼️ Media Only", "text": "📝 Text Only"}
+        cf_text = cf_map.get(instant_filter, "🔄 All Content")
+        btn_filter = InlineKeyboardButton(f"Filter: {cf_text}", callback_data=f"pair_coll_filter_{pair_id}")
+        
+        markup.row(btn_stop, btn_toggle)
+        markup.row(btn_filter)
     else:
         btn_toggle = InlineKeyboardButton("⚡ Instant Release", callback_data=f"pair_coll_toggle_{pair_id}_instant")
-    markup.row(btn_stop, btn_toggle)
+        markup.row(btn_stop, btn_toggle)
     return markup
 
 release_options = {} # Track release options: { "pid_source_type": "everything"/"media"/"text" }
@@ -2028,7 +2036,10 @@ async def process_automation_pipeline(client, messages, source_chat_id):
 
             # Execution Step B: Live Mirror/Forward Engine Routine
             if is_live:
-                if is_protected_flow:
+                # Fall back to custom mirroring if any message in the batch is a reply to another message
+                # to ensure that the reply connection is correctly mapped and preserved in the target chat.
+                is_reply = any(getattr(msg, 'reply_to_msg_id', None) for msg in messages)
+                if is_protected_flow or is_reply:
                     has_media = any(m.media for m in messages)
                     if has_media and not downloaded_files:
                         logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} because media download failed/skipped on protected chat.")
@@ -3845,7 +3856,9 @@ def handle_callbacks(call):
         instant_rel = (mode == "instant")
         opts = collection_options.setdefault(task_key, {})
         opts["instant_release"] = instant_rel
-        
+        if "instant_filter" not in opts:
+            opts["instant_filter"] = "everything"
+            
         status_text = "⚡ Instant Release Enabled" if instant_rel else "📥 Hold Release Enabled"
         bot.answer_callback_query(call.id, status_text)
         
@@ -3856,9 +3869,13 @@ def handle_callbacks(call):
             collected = opts["collected"]
             limit = opts["limit"]
             sent_count = opts["sent_count"]
+            instant_filter = opts.get("instant_filter", "everything")
             
             l_text = f" / {limit}" if limit else ""
             sent_label = f"`{sent_count}`" if instant_rel else f"`{sent_count} (Hold)`"
+            if instant_rel:
+                f_map = {"everything": "All", "media": "Media Only", "text": "Text Only"}
+                sent_label += f" ({f_map.get(instant_filter, 'All')})"
             
             try:
                 bot.edit_message_text(
@@ -3879,6 +3896,57 @@ def handle_callbacks(call):
                 )
             except Exception as e:
                 logger.error(f"Error editing reply markup in toggle callback: {e}")
+
+    elif data.startswith("pair_coll_filter_"):
+        pid = int(data.split("_")[-1])
+        task_key = f"coll_{pid}"
+        
+        # Check if task is running
+        if task_key not in running_tasks or not running_tasks[task_key]:
+            bot.answer_callback_query(call.id, "❌ Collection is not currently running.")
+            return
+            
+        opts = collection_options.setdefault(task_key, {})
+        current = opts.get("instant_filter", "everything")
+        next_filter = "media" if current == "everything" else "text" if current == "media" else "everything"
+        opts["instant_filter"] = next_filter
+        
+        bot.answer_callback_query(call.id, f"🎯 Filter: {next_filter.title()}")
+        
+        # Reconstruct the message text using saved states if available
+        if "s_title" in opts:
+            s_title = opts["s_title"]
+            scanned = opts["scanned"]
+            collected = opts["collected"]
+            limit = opts["limit"]
+            sent_count = opts["sent_count"]
+            curr_instant = opts.get("instant_release", False)
+            
+            l_text = f" / {limit}" if limit else ""
+            sent_label = f"`{sent_count}`" if curr_instant else f"`{sent_count} (Hold)`"
+            if curr_instant:
+                f_map = {"everything": "All", "media": "Media Only", "text": "Text Only"}
+                sent_label += f" ({f_map.get(next_filter, 'All')})"
+            
+            try:
+                bot.edit_message_text(
+                    f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: {sent_label}",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=get_collection_markup(pid),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Error editing message text in filter callback: {e}")
+        else:
+            try:
+                bot.edit_message_reply_markup(
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=get_collection_markup(pid)
+                )
+            except Exception as e:
+                logger.error(f"Error editing reply markup in filter callback: {e}")
 
     elif data.startswith("pair_release_"):
         pid = int(data.split("_")[-1])
@@ -4556,6 +4624,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     # Initialize collection options default state
     collection_options[task_key] = {
         "instant_release": False,
+        "instant_filter": "everything",
         "s_title": "Source",
         "scanned": 0,
         "collected": 0,
@@ -4583,8 +4652,11 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     
     try:
         # Force peer resolution (Anti PeerIdInvalid)
-        target_chat = await resolve_target_id(userbot, sid)
-        sid_resolved = target_chat.id
+        source_chat = await resolve_target_id(userbot, sid)
+        sid_resolved = source_chat.id
+        
+        dest_chat = await resolve_target_id(userbot, tid)
+        tid_resolved = dest_chat.id
         
         # Telethon uses iter_messages for history (newest to oldest)
         target_topic = None
@@ -4626,10 +4698,14 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 "sent_count": sent_count
             })
             curr_instant = opts.get("instant_release", False)
+            curr_filter = opts.get("instant_filter", "everything")
             
             if scanned % 50 == 0:
                 l_text = f" / {limit}" if limit else ""
                 sent_label = f"`{sent_count}`" if curr_instant else f"`{sent_count} (Hold)`"
+                if curr_instant:
+                    f_map = {"everything": "All", "media": "Media Only", "text": "Text Only"}
+                    sent_label += f" ({f_map.get(curr_filter, 'All')})"
                 try:
                     bot.edit_message_text(
                         f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: {sent_label}",
@@ -4673,7 +4749,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
         auto_mirror = is_mir
 
         # Check if protected flow
-        is_protected_flow = getattr(target_chat, 'noforwards', False)
+        is_protected_flow = getattr(source_chat, 'noforwards', False)
 
         # Save and forward both normally and through vault
         for batch in grouped_batches:
@@ -4684,11 +4760,28 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
             # Read dynamic option for this iteration
             opts = collection_options.setdefault(task_key, {})
             curr_instant = opts.get("instant_release", False)
+            instant_filter = opts.get("instant_filter", "everything")
+
+            # Filter batch content based on instant_filter
+            matching_batch = []
+            skipped_batch = []
+            
+            for msg in batch:
+                matches = True
+                if instant_filter == "media" and not msg.media:
+                    matches = False
+                elif instant_filter == "text" and msg.media:
+                    matches = False
+                    
+                if matches:
+                    matching_batch.append(msg)
+                else:
+                    skipped_batch.append(msg)
 
             # Pre-download files safely if the chat is restricted/protected and we are instantly releasing
             downloaded_files = []
-            if curr_instant and is_protected_flow:
-                for msg in batch:
+            if curr_instant and is_protected_flow and matching_batch:
+                for msg in matching_batch:
                     if msg.media:
                         try:
                             path = await userbot.download_media(msg.media)
@@ -4708,24 +4801,34 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
 
             try:
                 # 1. Forward directly to target group (Normally) if instant release is active
-                if curr_instant:
-                    has_media = any(msg.media for msg in batch)
+                if curr_instant and matching_batch:
+                    has_media = any(msg.media for msg in matching_batch)
                     if is_protected_flow:
                         if has_media and not downloaded_files:
                             logger.warning("🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
                         else:
-                            await send_mirrored_content(userbot, tid, batch, t_topic, auto_mirror, sid_resolved, pre_downloaded=downloaded_files if has_media else None)
+                            await send_mirrored_content(userbot, tid_resolved, matching_batch, t_topic, auto_mirror, sid_resolved, pre_downloaded=downloaded_files if has_media else None)
                     else:
-                        await send_mirrored_content(userbot, tid, batch, t_topic, auto_mirror, sid_resolved)
+                        await send_mirrored_content(userbot, tid_resolved, matching_batch, t_topic, auto_mirror, sid_resolved)
                     
-                    sent_count += len(batch)
+                    sent_count += len(matching_batch)
                 
                 # 2. Save to database
                 for m in batch:
                     m_type = get_specific_media_type(m.media)
+                    # Determine release status for this specific message
+                    if curr_instant:
+                        matches = True
+                        if instant_filter == "media" and not m.media:
+                            matches = False
+                        elif instant_filter == "text" and m.media:
+                            matches = False
+                        rel_val = 1 if matches else 0
+                    else:
+                        rel_val = 0
+
                     with db_conn() as conn:
                         c = conn.cursor()
-                        rel_val = 1 if curr_instant else 0
                         if USING_POSTGRES:
                             c.execute(
                                 "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (%s, %s, %s, %s, %s, 'collection', %s) ON CONFLICT DO NOTHING",
@@ -4737,13 +4840,13 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                                 (pair_id, sid_resolved, m.id, m_type, m.message or "", rel_val)
                             )
                 
-                # 3. Send to log bots (through Vault) if instant release is active
-                if curr_instant:
-                    has_media = any(msg.media for msg in batch)
+                # 3. Send to log bots (through Vault) if instant release is active and matching_batch exists
+                if curr_instant and matching_batch:
+                    has_media = any(msg.media for msg in matching_batch)
                     if is_protected_flow and downloaded_files:
                         for token, username, bot_id in get_log_bots():
-                            metadata = f"SID: {sid_resolved} | MID: {batch[0].id}\n"
-                            caption_text = metadata + (batch[0].message or "")
+                            metadata = f"SID: {sid_resolved} | MID: {matching_batch[0].id}\n"
+                            caption_text = metadata + (matching_batch[0].message or "")
                             try:
                                 vaulted_result = await userbot.send_message(
                                     entity=int(bot_id),
@@ -4753,7 +4856,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                                 if vaulted_result:
                                     v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
                                     for i, v_m in enumerate(v_msgs):
-                                        orig_m = batch[i]
+                                        orig_m = matching_batch[i]
                                         save_logged_media(
                                             bot_id=int(bot_id),
                                             log_msg_id=int(v_m.id),
@@ -4767,7 +4870,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                             except Exception as e:
                                 logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
                     elif not is_protected_flow or not has_media:
-                        asyncio.create_task(forward_to_log_bots(userbot, batch, sid_resolved))
+                        asyncio.create_task(forward_to_log_bots(userbot, matching_batch, sid_resolved))
             finally:
                 for temp_path in downloaded_files:
                     if os.path.exists(temp_path):
@@ -4780,10 +4883,14 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 "sent_count": sent_count
             })
             curr_instant = opts.get("instant_release", False)
+            curr_filter = opts.get("instant_filter", "everything")
 
             # Edit status message
             l_text = f" / {limit}" if limit else ""
             sent_label = f"`{sent_count}`" if curr_instant else f"`{sent_count} (Hold)`"
+            if curr_instant:
+                f_map = {"everything": "All", "media": "Media Only", "text": "Text Only"}
+                sent_label += f" ({f_map.get(curr_filter, 'All')})"
             try:
                 bot.edit_message_text(
                     f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: {sent_label}",
@@ -4799,7 +4906,10 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
 
         opts = collection_options.setdefault(task_key, {})
         curr_instant = opts.get("instant_release", False)
-        sent_label = f"Sent to Target: `{sent_count}`" if curr_instant else f"Sent to Target: `{sent_count} (Hold Mode)`"
+        instant_filter = opts.get("instant_filter", "everything")
+        f_map = {"everything": "All Content", "media": "Media Only", "text": "Text Only"}
+        f_label = f" matching {f_map.get(instant_filter, 'All Content')} 🔄" if curr_instant else ""
+        sent_label = f"Sent to Target: `{sent_count}`{f_label}" if curr_instant else f"Sent to Target: `{sent_count} (Hold Mode)`"
         bot.send_message(admin_chat_id, f"✅ Collection Done: `{s_title}`\nScanned: `{scanned}`\nCollected & Saved: `{collected}`\n{sent_label}")
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
@@ -4869,7 +4979,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
             if not running_tasks.get(task_key): break
             
             try:
-                msg = await userbot.get_messages(sid_ref, ids=smid)
+                msg = await userbot.get_messages(source_chat, ids=smid)
                 if not msg: continue
 
                 # --- CONTENT FILTERING ---
@@ -4900,15 +5010,8 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                 
                 # Determine if BOTH chats are forums to automatically mirror topics
                 auto_mirror = False
-                try:
-                    real_sid = sid_ref if str(sid_ref).startswith("-100") else int(f"-100{str(sid_ref).replace('-100', '')}")
-                    real_tid = tid_ref if str(tid_ref).startswith("-100") else int(f"-100{str(tid_ref).replace('-100', '')}")
-                    src_ent = await userbot.get_entity(real_sid)
-                    tgt_ent = await userbot.get_entity(real_tid)
-                    if getattr(src_ent, 'forum', False) and getattr(tgt_ent, 'forum', False):
-                        auto_mirror = True
-                except Exception:
-                    pass
+                if getattr(source_chat, 'forum', False) and getattr(target_chat, 'forum', False):
+                    auto_mirror = True
 
                 # Handle Mirroring ID detection for release
                 if auto_mirror:

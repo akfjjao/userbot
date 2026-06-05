@@ -5420,8 +5420,20 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                     pass
                 await asyncio.sleep(fwe.seconds)
             except Exception as e:
+                err_msg = str(e).lower()
+                if any(x in err_msg for x in ["private", "permission", "ban", "forbidden", "access"]):
+                    logger.warning(f"⚠️ RELEASE: Message ID {smid} is inaccessible ({e}). Marking as failed/skipped.")
+                    try:
+                        with db_conn() as conn:
+                            c = conn.cursor()
+                            p = get_placeholder()
+                            c.execute(f"UPDATE collected_media SET released = 2 WHERE id = {p}", (row_id,))
+                            conn.commit()
+                    except Exception as db_err:
+                        logger.error(f"Failed to update inaccessible status in DB: {db_err}")
                 logger.error(f"Release error: {e}")
                 idx += 1
+                await asyncio.sleep(0.05)
 
         bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items from {category_name} matching `{display_filter}`.")
     except Exception as e:

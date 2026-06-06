@@ -1104,6 +1104,24 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
         sender_bot.send_message(admin_chat_id, f"❌ Engine Error: {e}")
     finally:
         running_tasks.pop(task_key, None)
+# Global cache for reusing uploaded media references
+# Key: (source_chat_id, source_msg_id), Value: MessageMedia (or list/sequence of MessageMedia for albums)
+media_reference_cache = {}
+
+def get_vaulted_media_reference_db(source_chat_id, source_msg_id):
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(
+                f"SELECT bot_id, log_msg_id FROM log_media WHERE source_chat_id = {p} AND source_msg_id = {p}",
+                (int(source_chat_id), int(source_msg_id))
+            )
+            row = c.fetchone()
+            return row if row else None
+    except Exception as e:
+        logger.error(f"Error querying log_media for reference cache: {e}")
+        return None
 
 def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id=None):
     with db_conn() as conn:
@@ -1746,14 +1764,51 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
         metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
         caption_text = metadata + (first_msg.message or "")
         
+        # Check if we have cached media references for vault
+        files_to_vault = []
+        cache_hit = False
+        cached_files = []
+        media_msgs = [m for m in messages if m.media]
+        if media_msgs:
+            all_cached = True
+            for m in media_msgs:
+                cache_key = (int(source_chat_id), int(m.id))
+                if cache_key in media_reference_cache:
+                    cached_files.append(media_reference_cache[cache_key])
+                else:
+                    db_ref = get_vaulted_media_reference_db(source_chat_id, m.id)
+                    if db_ref:
+                        try:
+                            bot_id, log_msg_id = db_ref
+                            vault_msg = await client.get_messages(int(bot_id), ids=int(log_msg_id))
+                            if vault_msg and vault_msg.media:
+                                media_reference_cache[cache_key] = vault_msg.media
+                                cached_files.append(vault_msg.media)
+                                continue
+                        except Exception: pass
+                    all_cached = False
+                    break
+            
+            if all_cached and len(cached_files) == len(media_msgs):
+                files_to_vault = cached_files
+                cache_hit = True
+                logger.info(f"✨ VAULT: Reusing cached media references for {len(media_msgs)} messages (No upload needed).")
+        
+        if not cache_hit:
+            files_to_vault = [m.media for m in messages if m.media]
+
+        file_payload = files_to_vault if len(files_to_vault) > 1 else (files_to_vault[0] if files_to_vault else None)
+
         try:
-            # Send as album if multiple messages
+            # Send to vault bot
             vaulted_result = await client.send_message(
                 entity=target_peer,
-                file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
+                file=file_payload,
                 message=caption_text
             )
-            await asyncio.sleep(2)
+            # Pacing: For vault bot, if we had to upload (not cached), sleep 4.0s; if cached, 1.2s
+            pacing_delay = 1.2 if cache_hit else 4.0
+            await asyncio.sleep(pacing_delay)
         except errors.FloodWaitError as fwe:
             logger.warning(f"⏳ VAULT FLOOD: Waiting {fwe.seconds}s...")
             await asyncio.sleep(fwe.seconds)
@@ -1771,6 +1826,11 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
             for i, v_m in enumerate(v_msgs):
                 orig_m = messages[i]
                 logger.info(f"✅ VAULT: Message {orig_m.id} logged to @{t_name} -> Log ID: {v_m.id}")
+                
+                # Cache the vaulted media reference
+                if v_m.media:
+                    media_reference_cache[(int(source_chat_id), int(orig_m.id))] = v_m.media
+                
                 save_logged_media(
                     bot_id=int(log_chat_id),
                     log_msg_id=int(v_m.id),
@@ -1894,38 +1954,99 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
         
         # Determine the file/media to send
         files_to_send = []
-        if pre_downloaded:
-            if isinstance(pre_downloaded, dict):
-                for m in messages:
-                    if m.media:
-                        if m.id in pre_downloaded:
-                            files_to_send.append(pre_downloaded[m.id])
+        cache_hit = False
+        cached_files = []
+        
+        media_msgs = [m for m in messages if m.media]
+        if media_msgs:
+            all_cached = True
+            for m in media_msgs:
+                cache_key = (sid, m.id)
+                if cache_key in media_reference_cache:
+                    cached_files.append(media_reference_cache[cache_key])
+                else:
+                    db_ref = get_vaulted_media_reference_db(sid, m.id)
+                    if db_ref:
+                        try:
+                            bot_id, log_msg_id = db_ref
+                            vault_msg = await client.get_messages(int(bot_id), ids=int(log_msg_id))
+                            if vault_msg and vault_msg.media:
+                                media_reference_cache[cache_key] = vault_msg.media
+                                cached_files.append(vault_msg.media)
+                                continue
+                        except Exception as cache_ex:
+                            logger.error(f"Failed to fetch vaulted media reference: {cache_ex}")
+                    all_cached = False
+                    break
+            
+            if all_cached and len(cached_files) == len(media_msgs):
+                files_to_send = cached_files
+                cache_hit = True
+                logger.info(f"✨ MIRROR: Reusing cached media references for {len(media_msgs)} messages (No download/upload needed).")
+
+        if not cache_hit:
+            if pre_downloaded:
+                if isinstance(pre_downloaded, dict):
+                    for m in messages:
+                        if m.media:
+                            if m.id in pre_downloaded:
+                                files_to_send.append(pre_downloaded[m.id])
+                            else:
+                                files_to_send.append(m.media)
+                elif isinstance(pre_downloaded, list):
+                    media_msgs = [m for m in messages if m.media]
+                    for idx, m in enumerate(media_msgs):
+                        if idx < len(pre_downloaded):
+                            files_to_send.append(pre_downloaded[idx])
                         else:
-                            files_to_send.append(m)
-            elif isinstance(pre_downloaded, list):
-                media_msgs = [m for m in messages if m.media]
-                for idx, m in enumerate(media_msgs):
-                    if idx < len(pre_downloaded):
-                        files_to_send.append(pre_downloaded[idx])
-                    else:
-                        files_to_send.append(m)
-        else:
-            files_to_send = [m for m in messages if m.media]
+                            files_to_send.append(m.media)
+            else:
+                files_to_send = [m.media for m in messages if m.media]
             
         file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
+
+        async def _send_dispatch(file_val, reply_val):
+            if isinstance(file_val, list):
+                # Send as album using send_file
+                return await client.send_file(
+                    entity=target_entity,
+                    file=file_val,
+                    caption=album_text,
+                    reply_to=reply_val
+                )
+            else:
+                # Send single file or text using send_message
+                return await client.send_message(
+                    entity=target_entity,
+                    message=album_text,
+                    file=file_val,
+                    reply_to=reply_val
+                )
         
         for attempt in range(3):
             try:
-                sent = await client.send_message(
-                    entity=target_entity, 
-                    message=album_text, 
-                    file=file_to_send,
-                    reply_to=reply_header
-                )
+                sent = await _send_dispatch(file_to_send, reply_header)
                 if sent:
                     first_id = sent[0].id if isinstance(sent, list) else sent.id
                     logger.info(f"✅ MIRROR: Sent to {tid} -> MSG ID: {first_id}")
                     save_message_mapping(sid, first_msg.id, tid, first_id)
+                    
+                    # Cache successfully sent media references
+                    try:
+                        sent_msgs = sent if isinstance(sent, list) else [sent]
+                        for orig_m, sent_m in zip(media_msgs, sent_msgs):
+                            if sent_m.media:
+                                media_reference_cache[(sid, orig_m.id)] = sent_m.media
+                    except Exception as cache_err:
+                        logger.error(f"Failed to cache sent media reference: {cache_err}")
+
+                    # Pacing sleep
+                    if downloaded_files or (pre_downloaded and not cache_hit):
+                        pacing_delay = 4.0
+                    else:
+                        pacing_delay = 1.2
+                    logger.info(f"Pacing engine: Sleeping {pacing_delay}s...")
+                    await asyncio.sleep(pacing_delay)
                     break # Success!
             except errors.FloodWaitError as fwe:
                 logger.warning(f"⏳ MIRROR FLOOD: Waiting {fwe.seconds}s...")
@@ -1953,16 +2074,23 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         file_to_send = downloaded_files if len(downloaded_files) > 1 else downloaded_files[0]
                         # Retry sending immediately in this attempt using the local file
                         try:
-                            sent = await client.send_message(
-                                entity=target_entity,
-                                message=album_text,
-                                file=file_to_send,
-                                reply_to=reply_header
-                            )
+                            sent = await _send_dispatch(file_to_send, reply_header)
                             if sent:
                                 first_id = sent[0].id if isinstance(sent, list) else sent.id
                                 logger.info(f"✅ MIRROR: Sent via fallback to {tid} -> MSG ID: {first_id}")
                                 save_message_mapping(sid, first_msg.id, tid, first_id)
+                                
+                                # Cache successfully sent media references
+                                try:
+                                    sent_msgs = sent if isinstance(sent, list) else [sent]
+                                    for orig_m, sent_m in zip(media_msgs, sent_msgs):
+                                        if sent_m.media:
+                                            media_reference_cache[(sid, orig_m.id)] = sent_m.media
+                                except Exception as cache_err:
+                                    logger.error(f"Failed to cache sent media reference: {cache_err}")
+
+                                logger.info("Pacing engine: Sleeping 4.0s...")
+                                await asyncio.sleep(4.0)
                                 break
                         except Exception as fe:
                             e = fe
@@ -1976,31 +2104,53 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         
                         logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={reply_header} ({e}). Retrying with reply_to={next_reply_header}...")
                         try:
-                            sent = await client.send_message(
-                                entity=target_entity, 
-                                message=album_text, 
-                                file=file_to_send,
-                                reply_to=next_reply_header
-                            )
+                            sent = await _send_dispatch(file_to_send, next_reply_header)
                             if sent:
                                 first_id = sent[0].id if isinstance(sent, list) else sent.id
                                 logger.info(f"✅ MIRROR: Sent after reply downgrade to {tid} -> MSG ID: {first_id}")
                                 save_message_mapping(sid, first_msg.id, tid, first_id)
+                                
+                                # Cache successfully sent media references
+                                try:
+                                    sent_msgs = sent if isinstance(sent, list) else [sent]
+                                    for orig_m, sent_m in zip(media_msgs, sent_msgs):
+                                        if sent_m.media:
+                                            media_reference_cache[(sid, orig_m.id)] = sent_m.media
+                                except Exception as cache_err:
+                                    logger.error(f"Failed to cache sent media reference: {cache_err}")
+
+                                if downloaded_files or (pre_downloaded and not cache_hit):
+                                    pacing_delay = 4.0
+                                else:
+                                    pacing_delay = 1.2
+                                logger.info(f"Pacing engine: Sleeping {pacing_delay}s...")
+                                await asyncio.sleep(pacing_delay)
                                 break
                         except Exception as e2:
                             if next_reply_header is not None:
                                 logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={next_reply_header} ({e2}). Retrying with reply_to=None...")
                                 try:
-                                    sent = await client.send_message(
-                                        entity=target_entity, 
-                                        message=album_text, 
-                                        file=file_to_send,
-                                        reply_to=None
-                                    )
+                                    sent = await _send_dispatch(file_to_send, None)
                                     if sent:
                                         first_id = sent[0].id if isinstance(sent, list) else sent.id
                                         logger.info(f"✅ MIRROR: Sent after final reply clear to {tid} -> MSG ID: {first_id}")
                                         save_message_mapping(sid, first_msg.id, tid, first_id)
+                                        
+                                        # Cache successfully sent media references
+                                        try:
+                                            sent_msgs = sent if isinstance(sent, list) else [sent]
+                                            for orig_m, sent_m in zip(media_msgs, sent_msgs):
+                                                if sent_m.media:
+                                                    media_reference_cache[(sid, orig_m.id)] = sent_m.media
+                                        except Exception as cache_err:
+                                            logger.error(f"Failed to cache sent media reference: {cache_err}")
+
+                                        if downloaded_files or (pre_downloaded and not cache_hit):
+                                            pacing_delay = 4.0
+                                        else:
+                                            pacing_delay = 1.2
+                                        logger.info(f"Pacing engine: Sleeping {pacing_delay}s...")
+                                        await asyncio.sleep(pacing_delay)
                                         break
                                 except Exception as e3:
                                     e = e3
@@ -5235,11 +5385,18 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
         display_filter = f_names.get(release_filter, "All Content 🔄")
         status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items from {category_name}...\n🎯 Filter: `{display_filter}`", reply_markup=markup)
         
+        advance = True
         idx = 0
         while idx < len(items):
             if not running_tasks.get(task_key): break
             row_id, smid = items[idx]
             
+            # Proactive Rate-Limit Prevention:
+            # Every 10 consecutive media transfers, inject a safety rest window
+            if sent > 0 and sent % 10 == 0 and advance:
+                logger.info("ℹ️ Spacing engine: Injecting proactive 15-second cooldown to preserve account health...")
+                await asyncio.sleep(15)
+
             advance = True
             try:
                 msg = await userbot.get_messages(source_chat, ids=smid)
@@ -5303,12 +5460,36 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                 # If it's a specific reply, use it. Otherwise, use the Topic Header ID.
                 final_reply_target = reply_to_val if reply_to_val else target_topic_anchor
 
+                # Try to use cached/vaulted media reference if available to avoid download/upload
+                media_file = msg.media
+                is_cached = False
+                if msg.media:
+                    cache_key = (sid_ref, msg.id)
+                    if cache_key in media_reference_cache:
+                        media_file = media_reference_cache[cache_key]
+                        is_cached = True
+                        logger.info(f"✨ RELEASE: Reusing in-memory cached media reference for message {msg.id}")
+                    else:
+                        db_ref = get_vaulted_media_reference_db(sid_ref, msg.id)
+                        if db_ref:
+                            try:
+                                bot_id, log_msg_id = db_ref
+                                vault_msg = await userbot.get_messages(int(bot_id), ids=int(log_msg_id))
+                                if vault_msg and vault_msg.media:
+                                    media_file = vault_msg.media
+                                    media_reference_cache[cache_key] = vault_msg.media
+                                    is_cached = True
+                                    logger.info(f"✨ RELEASE: Reusing DB-vaulted media reference for message {msg.id}")
+                            except Exception as cache_ex:
+                                logger.error(f"Failed to fetch vaulted media reference for release: {cache_ex}")
+
                 sent_msg = None
+                local_file = None
                 try:
                     sent_msg = await userbot.send_message(
                         entity=target_chat,
                         message=msg.message or "",
-                        file=msg.media,
+                        file=media_file,
                         reply_to=int(final_reply_target) if final_reply_target else None
                     )
                 except Exception as e:
@@ -5324,7 +5505,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                             sent_msg = await userbot.send_message(
                                 entity=target_chat,
                                 message=msg.message or "",
-                                file=msg.media,
+                                file=media_file,
                                 reply_to=next_reply
                             )
                         except Exception as e2:
@@ -5334,7 +5515,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                                     sent_msg = await userbot.send_message(
                                         entity=target_chat,
                                         message=msg.message or "",
-                                        file=msg.media,
+                                        file=media_file,
                                         reply_to=None
                                     )
                                 except Exception as e3:
@@ -5347,7 +5528,6 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                         err_msg = str(e).lower()
                         if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"]):
                             logger.info("🛡️ RELEASE: Protected or invalid peer media detected. Attempting download & upload fallback...")
-                            local_file = None
                             try:
                                 local_file = await userbot.download_media(msg)
                             except errors.FloodWaitError as fwe:
@@ -5404,6 +5584,8 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                 
                 if sent_msg:
                     save_message_mapping(sid_ref, msg.id, tid_ref, sent_msg.id)
+                    if sent_msg.media and not is_cached:
+                        media_reference_cache[(sid_ref, msg.id)] = sent_msg.media
                     with db_conn() as conn:
                         c = conn.cursor()
                         p = get_placeholder()
@@ -5412,7 +5594,14 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                 if sent % 5 == 0:
                     try: bot.edit_message_text(f"🚀 Releasing `{s_title}` ({category_name})...\n🎯 Filter: `{display_filter}`\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
                     except Exception: pass
-                await asyncio.sleep(interval)
+                
+                # Dynamic pacing sleep
+                if local_file: # if it had to do download & upload fallback
+                    pacing_delay = 4.0
+                else:
+                    pacing_delay = max(interval, 1.5)
+                logger.info(f"RELEASE pacing: Sleeping {pacing_delay}s...")
+                await asyncio.sleep(pacing_delay)
             except errors.FloodWaitError as fwe:
                 logger.warning(f"⏳ RELEASE FLOOD: A wait of {fwe.seconds} seconds is required. Sleeping...")
                 try:

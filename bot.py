@@ -1989,21 +1989,28 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                 if isinstance(pre_downloaded, dict):
                     for m in messages:
                         if m.media:
-                            if m.id in pre_downloaded:
+                            if m.id in pre_downloaded and pre_downloaded[m.id]:
                                 files_to_send.append(pre_downloaded[m.id])
                             else:
                                 files_to_send.append(m.media)
                 elif isinstance(pre_downloaded, list):
-                    media_msgs = [m for m in messages if m.media]
-                    for idx, m in enumerate(media_msgs):
-                        if idx < len(pre_downloaded):
-                            files_to_send.append(pre_downloaded[idx])
-                        else:
-                            files_to_send.append(m.media)
+                    # Flatten or clear any None elements from the pre_downloaded array
+                    clean_paths = [p for p in pre_downloaded if p]
+                    if clean_paths:
+                        files_to_send.extend(clean_paths)
+                    else:
+                        files_to_send = [m.media for m in messages if m.media]
             else:
                 files_to_send = [m.media for m in messages if m.media]
             
         file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
+
+        # CRITICAL FIX: If no file is attached and text is completely empty, 
+        # add a blank space placeholder string so Telethon won't throw an EmptyMessage error.
+        if not file_to_send and not album_text.strip():
+            album_text = " "
+        elif not album_text or not album_text.strip():
+            album_text = " "
 
         async def _send_dispatch(file_val, reply_val):
             if isinstance(file_val, list):
@@ -5485,10 +5492,19 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
 
                 sent_msg = None
                 local_file = None
+                
+                # CRITICAL FIX: If no file is attached and text is completely empty, 
+                # add a blank space placeholder string so Telethon won't throw an EmptyMessage error.
+                msg_text = msg.message or ""
+                if not media_file and not msg_text.strip():
+                    msg_text = " "
+                elif not msg_text or not msg_text.strip():
+                    msg_text = " "
+
                 try:
                     sent_msg = await userbot.send_message(
                         entity=target_chat,
-                        message=msg.message or "",
+                        message=msg_text,
                         file=media_file,
                         reply_to=int(final_reply_target) if final_reply_target else None
                     )
@@ -5504,7 +5520,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                         try:
                             sent_msg = await userbot.send_message(
                                 entity=target_chat,
-                                message=msg.message or "",
+                                message=msg_text,
                                 file=media_file,
                                 reply_to=next_reply
                             )
@@ -5514,7 +5530,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                                 try:
                                     sent_msg = await userbot.send_message(
                                         entity=target_chat,
-                                        message=msg.message or "",
+                                        message=msg_text,
                                         file=media_file,
                                         reply_to=None
                                     )
@@ -5526,7 +5542,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                     # If still failed, check if we need to do fallback download & upload
                     if not sent_msg:
                         err_msg = str(e).lower()
-                        if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"]):
+                        if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer", "empty"]):
                             logger.info("🛡️ RELEASE: Protected or invalid peer media detected. Attempting download & upload fallback...")
                             try:
                                 local_file = await userbot.download_media(msg)
@@ -5538,7 +5554,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                                 try:
                                     sent_msg = await userbot.send_message(
                                         entity=target_chat,
-                                        message=msg.message or "",
+                                        message=msg_text,
                                         file=local_file,
                                         reply_to=int(final_reply_target) if final_reply_target else None
                                     )
@@ -5554,7 +5570,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                                         try:
                                             sent_msg = await userbot.send_message(
                                                 entity=target_chat,
-                                                message=msg.message or "",
+                                                message=msg_text,
                                                 file=local_file,
                                                 reply_to=next_reply
                                             )
@@ -5564,7 +5580,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                                                 try:
                                                     sent_msg = await userbot.send_message(
                                                         entity=target_chat,
-                                                        message=msg.message or "",
+                                                        message=msg_text,
                                                         file=local_file,
                                                         reply_to=None
                                                     )

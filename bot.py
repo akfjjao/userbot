@@ -2084,28 +2084,6 @@ async def process_automation_pipeline(client, messages, source_chat_id):
     if not msg_topic_anchor and first_msg.reply_to_msg_id:
         msg_topic_anchor = first_msg.reply_to_msg_id
 
-    # Filter active pairs matching source chat and topic ID (if applicable)
-    msg_chat_str = str(source_chat_id).replace("-100", "")
-    active_pairs = []
-    for p in pairs:
-        pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf = p
-        if str(sid).replace("-100", "") != msg_chat_str:
-            continue
-        
-        topic_filter_id = None
-        if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
-            try: topic_filter_id = int(s_topic)
-            except Exception: pass
-        if topic_filter_id is not None and str(msg_topic_anchor) != str(topic_filter_id):
-            continue
-            
-        if is_mon or is_live:
-            active_pairs.append(p)
-            
-    if not active_pairs:
-        # Exit early if no active pairs are registered for this source channel/topic
-        return
-
     # 2. FIXED: Reliable Live Entity Fetching & Map Syncing
     is_protected_flow = False
     try:
@@ -2154,7 +2132,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
         already_vaulted = False
         msg_chat_str = str(source_chat_id).replace("-100", "")
         
-        for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in active_pairs:
+        for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
             source_id_str = str(sid).replace("-100", "")
             if source_id_str != msg_chat_str:
                 continue
@@ -2196,7 +2174,6 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                                 "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (?, ?, ?, ?, ?, 'monitor', ?)",
                                 (pid, sid, msg.id, m_type, msg.message or "", rel_val)
                             )
-                        logger.info(f"💾 DATABASE: Saved message {msg.id} from chat {sid} to DB (Pair {pid}, Released: {rel_val})")
 
             # Execution Step B: Live Mirror/Forward Engine Routine
             if is_live:
@@ -4706,13 +4683,14 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                             if path:
                                 media_to_file[msg.id] = path
                         except errors.FloodWaitError as fwe:
-                            logger.warning(f"⏳ SCRAPE FLOOD: Download media flood wait of {fwe.seconds}s required. Sleeping...")
-                            await asyncio.sleep(fwe.seconds)
-                            try:
-                                path = await userbot.download_media(msg)
-                                if path: media_to_file[msg.id] = path
-                            except Exception as e2:
-                                logger.error(f"Failed to download media after flood wait: {e2}")
+                            logger.warning(f"⏳ SCRAPE FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
+                            if fwe.seconds <= 5:
+                                await asyncio.sleep(fwe.seconds)
+                                try:
+                                    path = await userbot.download_media(msg)
+                                    if path: media_to_file[msg.id] = path
+                                except Exception as e2:
+                                    logger.error(f"Failed to download media after short flood wait: {e2}")
                         except Exception as e:
                             logger.error(f"Failed to download media for message {msg.id}: {e}")
 
@@ -4723,13 +4701,11 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     if has_media and not any(msg.id in media_to_file for msg in batch):
                         logger.warning("🛡️ SCRAPE: Skipping mirror because media download failed/skipped.")
                     else:
-                        await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
-                        sent_count += len(batch)
-                        await asyncio.sleep(1.5)
+                        await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved, pre_downloaded=[media_to_file[msg.id] for msg in batch if msg.id in media_to_file] if (is_protected_flow and has_media) else None)
                 else:
                     await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved)
-                    sent_count += len(batch)
-                    await asyncio.sleep(1.5)
+                
+                sent_count += len(batch)
                 
                 # Vaulting / Log bots logic if enabled
                 if is_mon:
@@ -5052,13 +5028,14 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                             if path:
                                 media_to_file[msg.id] = path
                         except errors.FloodWaitError as fwe:
-                            logger.warning(f"⏳ COLLECTION FLOOD: Download media flood wait of {fwe.seconds}s required. Sleeping...")
-                            await asyncio.sleep(fwe.seconds)
-                            try:
-                                path = await userbot.download_media(msg)
-                                if path: media_to_file[msg.id] = path
-                            except Exception as e2:
-                                logger.error(f"Failed to download media after flood wait: {e2}")
+                            logger.warning(f"⏳ COLLECTION FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
+                            if fwe.seconds <= 5:
+                                await asyncio.sleep(fwe.seconds)
+                                try:
+                                    path = await userbot.download_media(msg)
+                                    if path: media_to_file[msg.id] = path
+                                except Exception as e2:
+                                    logger.error(f"Failed to download media after short flood wait: {e2}")
                         except Exception as e:
                             logger.error(f"Failed to download media for message {msg.id}: {e}")
 
@@ -5070,13 +5047,11 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                         if has_media and not any(msg.id in media_to_file for msg in matching_batch):
                             logger.warning("🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
                         else:
-                            await send_mirrored_content(userbot, tid_resolved, matching_batch, t_topic, auto_mirror, sid_resolved, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
-                            sent_count += len(matching_batch)
-                            await asyncio.sleep(1.5)
+                            await send_mirrored_content(userbot, tid_resolved, matching_batch, t_topic, auto_mirror, sid_resolved, pre_downloaded=[media_to_file[msg.id] for msg in matching_batch if msg.id in media_to_file] if (is_protected_flow and has_media) else None)
                     else:
                         await send_mirrored_content(userbot, tid_resolved, matching_batch, t_topic, auto_mirror, sid_resolved)
-                        sent_count += len(matching_batch)
-                        await asyncio.sleep(1.5)
+                    
+                    sent_count += len(matching_batch)
                 
                 # 2. Save to database
                 with db_conn() as conn:
@@ -5406,6 +5381,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
 
             # Send using send_mirrored_content
             msgs_to_send = [msg for _, msg in matching_batch]
+            pre_downloaded_list = [media_to_file[m.id] for m in msgs_to_send if m.id in media_to_file]
             
             sent_msg = None
             try:
@@ -5416,7 +5392,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                     t_topic,
                     is_mir,
                     sid_ref,
-                    pre_downloaded=media_to_file if (is_protected_flow and media_to_file) else None
+                    pre_downloaded=pre_downloaded_list if (is_protected_flow and pre_downloaded_list) else None
                 )
             except Exception as e:
                 logger.error(f"Release send error: {e}")

@@ -5240,9 +5240,16 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
             if not running_tasks.get(task_key): break
             row_id, smid = items[idx]
             
+            advance = True
             try:
                 msg = await userbot.get_messages(source_chat, ids=smid)
-                if not msg: continue
+                if not msg:
+                    # Message is deleted/empty, mark it as inaccessible/skipped so we don't loop on it
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE collected_media SET released = 2 WHERE id = {p}", (row_id,))
+                    continue
 
                 # --- CONTENT FILTERING ---
                 cf = cf or "everything"
@@ -5406,7 +5413,6 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                     try: bot.edit_message_text(f"🚀 Releasing `{s_title}` ({category_name})...\n🎯 Filter: `{display_filter}`\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
                     except Exception: pass
                 await asyncio.sleep(interval)
-                idx += 1
             except errors.FloodWaitError as fwe:
                 logger.warning(f"⏳ RELEASE FLOOD: A wait of {fwe.seconds} seconds is required. Sleeping...")
                 try:
@@ -5419,6 +5425,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                 except Exception:
                     pass
                 await asyncio.sleep(fwe.seconds)
+                advance = False
             except Exception as e:
                 err_msg = str(e).lower()
                 if any(x in err_msg for x in ["private", "permission", "ban", "forbidden", "access"]):
@@ -5432,8 +5439,10 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                     except Exception as db_err:
                         logger.error(f"Failed to update inaccessible status in DB: {db_err}")
                 logger.error(f"Release error: {e}")
-                idx += 1
                 await asyncio.sleep(0.05)
+            finally:
+                if advance:
+                    idx += 1
 
         bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items from {category_name} matching `{display_filter}`.")
     except Exception as e:

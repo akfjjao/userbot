@@ -98,7 +98,6 @@ USING_POSTGRES = False
 # Album Cache for grouping media
 # {grouped_id: [message_objects]}
 album_cache = {}
-album_processing_lock = set() # Track groups actively running pipeline execution
 
 # Deduplication cache for incoming message events
 processed_messages = set()
@@ -1170,64 +1169,6 @@ userbot = None
 admin_states = {}
 login_data = {} # Temporary storage for login steps
 running_tasks = {} # Track long-running tasks for cancellation: { "hist_1": True, "coll_1": True }
-collection_options = {} # Track collection options for active tasks: { "coll_1": {"instant_release": False} }
-
-def get_collection_markup(pair_id):
-    task_key = f"coll_{pair_id}"
-    options = collection_options.setdefault(task_key, {
-        "instant_release": False,
-        "instant_filter": "everything",
-        "collect_filter": "everything"
-    })
-    instant_release = options.get("instant_release", False)
-    instant_filter = options.get("instant_filter", "everything")
-    collect_filter = options.get("collect_filter", "everything")
-    
-    markup = InlineKeyboardMarkup()
-    btn_stop = InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}")
-    
-    # Collect filter button
-    col_map = {
-        "everything": "🔄 All Content",
-        "media": "🖼️ Media Only",
-        "text": "📝 Text Only",
-        "file": "📁 Files Only"
-    }
-    col_text = col_map.get(collect_filter, "🔄 All Content")
-    btn_collect_filter = InlineKeyboardButton(f"Collect: {col_text}", callback_data=f"pair_coll_cfilter_{pair_id}")
-    
-    if instant_release:
-        btn_toggle = InlineKeyboardButton("📥 Hold Release", callback_data=f"pair_coll_toggle_{pair_id}_hold")
-        
-        cf_map = {"everything": "🔄 All Content", "media": "🖼️ Media Only", "text": "📝 Text Only"}
-        cf_text = cf_map.get(instant_filter, "🔄 All Content")
-        btn_filter = InlineKeyboardButton(f"Filter: {cf_text}", callback_data=f"pair_coll_filter_{pair_id}")
-        
-        markup.row(btn_stop, btn_toggle)
-        markup.row(btn_collect_filter, btn_filter)
-    else:
-        btn_toggle = InlineKeyboardButton("⚡ Instant Release", callback_data=f"pair_coll_toggle_{pair_id}_instant")
-        markup.row(btn_stop, btn_toggle)
-        markup.row(btn_collect_filter)
-    return markup
-
-release_options = {} # Track release options: { "pid_source_type": "everything"/"media"/"text" }
-
-def get_release_markup(pid, source_type):
-    key = f"{pid}_{source_type}"
-    curr_filter = release_options.setdefault(key, "everything")
-    
-    cf_map = {"everything": "🔄 All Content", "media": "🖼️ Media Only", "text": "📝 Text Only"}
-    cf_text = cf_map.get(curr_filter, "🔄 All Content")
-    
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(InlineKeyboardButton(f"Release Filter: {cf_text}", callback_data=f"pair_rel_filter_{source_type}_{pid}"))
-    markup.add(
-        InlineKeyboardButton("⚡ Instant Release", callback_data=f"pair_rel_now_{source_type}_{pid}"),
-        InlineKeyboardButton("⏰ Scheduled (Slow)", callback_data=f"pair_rel_slow_{source_type}_{pid}")
-    )
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"pair_release_{pid}"))
-    return markup
 
 def stop_task(task_key):
     if task_key in running_tasks:
@@ -1784,37 +1725,8 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
     except Exception as e:
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
 
-def update_telethon_entity_cache(client, peer):
-    """Safely and dynamically updates Telethon's internal entity caches."""
-    if not peer:
-        return
-    try:
-        if hasattr(client, '_entity_cache'):
-            cache = client._entity_cache
-            if hasattr(cache, 'add'):
-                cache.add(peer)
-            elif hasattr(cache, 'extend'):
-                cache.extend([], [peer])
-            elif isinstance(cache, dict):
-                cache[peer.id] = peer
-    except Exception as e:
-        logger.error(f"Failed to update client._entity_cache: {e}")
-
-    try:
-        if hasattr(client, '_mb_entity_cache'):
-            mb_cache = client._mb_entity_cache
-            if hasattr(mb_cache, 'extend'):
-                mb_cache.extend([], [peer])
-            elif hasattr(mb_cache, 'add'):
-                mb_cache.add(peer)
-            elif isinstance(mb_cache, dict):
-                mb_cache[peer.id] = peer
-    except Exception as e:
-        logger.error(f"Failed to update client._mb_entity_cache: {e}")
-
 async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid, pre_downloaded=None):
     """Unified Hub for mirrored sending with native Forum Topic support."""
-    downloaded_files = []
     try:
         if not messages: return
         first_msg = messages[0]
@@ -1864,55 +1776,25 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
         reply_header = None
         if is_forum:
             reply_header = int(dest_topic_id) if dest_topic_id else None
-            
-            top_msg_id = None
-            if first_msg.reply_to:
-                top_msg_id = getattr(first_msg.reply_to, 'reply_to_top_id', None)
-                if not top_msg_id and first_msg.reply_to.reply_to_msg_id:
-                    top_msg_id = first_msg.reply_to.reply_to_msg_id
-            
-            if top_msg_id:
-                mapped_top = get_message_mapping(sid, top_msg_id, tid)
-                if mapped_top:
-                    reply_header = int(mapped_top)
-            
             # If replying to a specific message inside the topic, use mapped ID
-            if first_msg.reply_to_msg_id and (not top_msg_id or first_msg.reply_to_msg_id != top_msg_id):
+            if first_msg.reply_to_msg_id:
                 mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                if mapped:
-                    reply_header = int(mapped)
+                if mapped: reply_header = int(mapped)
         else:
             # Normal Group: Use Message Mapping for Replies
             if first_msg.reply_to_msg_id:
                 mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                if mapped:
-                    reply_header = int(mapped)
+                if mapped: reply_header = int(mapped)
 
         # 4. Send Content
         album_text = next((msg.message for msg in messages if msg.message), "")
         sent = None
         
         # Determine the file/media to send
-        files_to_send = []
         if pre_downloaded:
-            if isinstance(pre_downloaded, dict):
-                for m in messages:
-                    if m.media:
-                        if m.id in pre_downloaded:
-                            files_to_send.append(pre_downloaded[m.id])
-                        else:
-                            files_to_send.append(m)
-            elif isinstance(pre_downloaded, list):
-                media_msgs = [m for m in messages if m.media]
-                for idx, m in enumerate(media_msgs):
-                    if idx < len(pre_downloaded):
-                        files_to_send.append(pre_downloaded[idx])
-                    else:
-                        files_to_send.append(m)
+            file_to_send = pre_downloaded if len(pre_downloaded) > 1 else pre_downloaded[0]
         else:
-            files_to_send = [m for m in messages if m.media]
-            
-        file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
+            file_to_send = [m.media for m in messages] if len(messages) > 1 else messages[0].media
         
         for attempt in range(3):
             try:
@@ -1933,91 +1815,51 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
             except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
                 await asyncio.sleep(2)
             except Exception as e:
-                # If the error is due to protected/restricted media, try downloading and uploading it
-                err_msg = str(e).lower()
-                is_protected_error = any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer", "empty"])
-                
-                # Check if we should attempt download & upload fallback
-                if is_protected_error and not pre_downloaded and not downloaded_files and any(m.media for m in messages):
-                    logger.info(f"🛡️ MIRROR: Protected/empty media error detected ({e}). Attempting download & upload fallback...")
-                    for m in messages:
-                        if m.media:
-                            try:
-                                path = await client.download_media(m)
-                                if path:
-                                    downloaded_files.append(path)
-                            except Exception as de:
-                                logger.error(f"Mirror download fallback failed: {de}")
+                # If we had a reply_header set, attempt to fallback/downgrade reply first
+                if reply_header is not None:
+                    next_reply_header = None
+                    if is_forum and dest_topic_id and reply_header != int(dest_topic_id):
+                        next_reply_header = int(dest_topic_id)
                     
-                    if downloaded_files:
-                        file_to_send = downloaded_files if len(downloaded_files) > 1 else downloaded_files[0]
-                        # Retry sending immediately in this attempt using the local file
-                        try:
-                            sent = await client.send_message(
-                                entity=target_entity,
-                                message=album_text,
-                                file=file_to_send,
-                                reply_to=reply_header
-                            )
-                            if sent:
-                                first_id = sent[0].id if isinstance(sent, list) else sent.id
-                                logger.info(f"✅ MIRROR: Sent via fallback to {tid} -> MSG ID: {first_id}")
-                                save_message_mapping(sid, first_msg.id, tid, first_id)
-                                break
-                        except Exception as fe:
-                            e = fe
-                
-                # If still not sent, attempt reply fallbacks/downgrades
-                if not sent:
-                    if reply_header is not None:
-                        next_reply_header = None
-                        if is_forum and dest_topic_id and reply_header != int(dest_topic_id):
-                            next_reply_header = int(dest_topic_id)
-                        
-                        logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={reply_header} ({e}). Retrying with reply_to={next_reply_header}...")
-                        try:
-                            sent = await client.send_message(
-                                entity=target_entity, 
-                                message=album_text, 
-                                file=file_to_send,
-                                reply_to=next_reply_header
-                            )
-                            if sent:
-                                first_id = sent[0].id if isinstance(sent, list) else sent.id
-                                logger.info(f"✅ MIRROR: Sent after reply downgrade to {tid} -> MSG ID: {first_id}")
-                                save_message_mapping(sid, first_msg.id, tid, first_id)
-                                break
-                        except Exception as e2:
-                            if next_reply_header is not None:
-                                logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={next_reply_header} ({e2}). Retrying with reply_to=None...")
-                                try:
-                                    sent = await client.send_message(
-                                        entity=target_entity, 
-                                        message=album_text, 
-                                        file=file_to_send,
-                                        reply_to=None
-                                    )
-                                    if sent:
-                                        first_id = sent[0].id if isinstance(sent, list) else sent.id
-                                        logger.info(f"✅ MIRROR: Sent after final reply clear to {tid} -> MSG ID: {first_id}")
-                                        save_message_mapping(sid, first_msg.id, tid, first_id)
-                                        break
-                                except Exception as e3:
-                                    e = e3
-                            else:
-                                e = e2
+                    logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={reply_header} ({e}). Retrying with reply_to={next_reply_header}...")
+                    try:
+                        sent = await client.send_message(
+                            entity=target_entity, 
+                            message=album_text, 
+                            file=file_to_send,
+                            reply_to=next_reply_header
+                        )
+                        if sent:
+                            first_id = sent[0].id if isinstance(sent, list) else sent.id
+                            logger.info(f"✅ MIRROR: Sent after reply downgrade to {tid} -> MSG ID: {first_id}")
+                            save_message_mapping(sid, first_msg.id, tid, first_id)
+                            break
+                    except Exception as e2:
+                        if next_reply_header is not None:
+                            logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={next_reply_header} ({e2}). Retrying with reply_to=None...")
+                            try:
+                                sent = await client.send_message(
+                                    entity=target_entity, 
+                                    message=album_text, 
+                                    file=file_to_send,
+                                    reply_to=None
+                                )
+                                if sent:
+                                    first_id = sent[0].id if isinstance(sent, list) else sent.id
+                                    logger.info(f"✅ MIRROR: Sent after final reply clear to {tid} -> MSG ID: {first_id}")
+                                    save_message_mapping(sid, first_msg.id, tid, first_id)
+                                    break
+                            except Exception as e3:
+                                e = e3
+                        else:
+                            e = e2
                 
                 logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
                 if attempt == 2: # Last attempt
                     logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
-                    
+        
     except Exception as e:
         logger.error(f"Global Mirror Error: {e}")
-    finally:
-        for path in downloaded_files:
-            if os.path.exists(path):
-                try: os.remove(path)
-                except Exception: pass
 
 
 def get_specific_media_type(media):
@@ -2063,11 +1905,10 @@ def get_pair_source_counts(pair_id):
 async def process_automation_pipeline(client, messages, source_chat_id):
     """
     Unified execution core. 
-    Correctly updates network entity maps and routes mixed message batches securely.
+    Downloads restricted content exactly once, distributing safely 
+    across all operational channels (Live, Vault, DB).
     """
     pairs = get_target_pairs()
-    if not messages: 
-        return
     first_msg = messages[0]
     
     # 1. Topic Identification Routing
@@ -2079,57 +1920,46 @@ async def process_automation_pipeline(client, messages, source_chat_id):
     if not msg_topic_anchor and first_msg.reply_to_msg_id:
         msg_topic_anchor = first_msg.reply_to_msg_id
 
-    # 2. FIXED: Reliable Live Entity Fetching & Map Syncing
+    # 2. Pre-download files safely if the chat is restricted/protected
+    downloaded_files = []
     is_protected_flow = False
+    
     try:
         chat_peer = await client.get_entity(source_chat_id)
-        # Check initial flag status
-        if getattr(chat_peer, 'noforwards', False):
-            # Force structural updates over the network wire to purge stale attributes
-            from telethon.tl.functions.channels import GetChannelsRequest
-            from telethon.tl.types import InputChannel
-            
-            if hasattr(chat_peer, 'access_hash'):
-                input_channel = InputChannel(chat_peer.id, chat_peer.access_hash)
-                res = await client(GetChannelsRequest(id=[input_channel]))
-                if res and res.chats:
-                    fresh_peer = res.chats[0]
-                    is_protected_flow = getattr(fresh_peer, 'noforwards', False)
-                    # Correctly bind the structural entity metadata to Telethon's internal maps
-                    update_telethon_entity_cache(client, fresh_peer)
-            else:
-                is_protected_flow = getattr(chat_peer, 'noforwards', False)
+        is_protected_flow = getattr(chat_peer, 'noforwards', False)
     except Exception as e:
-        logger.error(f"Failed to refresh stale entity cache for chat {source_chat_id}: {e}")
+        logger.error(f"Failed to check noforwards for chat {source_chat_id}: {e}")
         is_protected_flow = False
 
-    # 3. Pre-download files safely if the chat is truly restricted
-    media_to_file = {} # {msg_id: local_path}
     if is_protected_flow:
-        logger.info(f"🛡️ PIPELINE: Protected source chat verified (-100{str(source_chat_id).replace('-100', '')}). Pre-downloading media...")
+        logger.info(f"🛡️ PIPELINE: Protected source chat detected ({source_chat_id}). Pre-downloading media...")
         for msg in messages:
             if msg.media:
                 try:
-                    path = await client.download_media(msg)
+                    path = await client.download_media(msg.media)
                     if path:
-                        media_to_file[msg.id] = path
+                        downloaded_files.append(path)
                 except errors.FloodWaitError as fwe:
-                    logger.warning(f"⏳ PIPELINE FLOOD: Download limit hit. Sleeping {fwe.seconds}s...")
-                    await asyncio.sleep(fwe.seconds)
-                    try:
-                        path = await client.download_media(msg)
-                        if path: media_to_file[msg.id] = path
-                    except Exception: pass
+                    logger.warning(f"⏳ PIPELINE FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
+                    if fwe.seconds <= 5:
+                        await asyncio.sleep(fwe.seconds)
+                        try:
+                            path = await client.download_media(msg.media)
+                            if path:
+                                downloaded_files.append(path)
+                        except Exception as e2:
+                            logger.error(f"Failed to download media after short flood wait: {e2}")
                 except Exception as e:
-                    logger.error(f"Failed to copy media asset: {e}")
+                    logger.error(f"Failed to download media for message {msg.id}: {e}")
 
     try:
         already_vaulted = False
-        msg_chat_str = str(source_chat_id).replace("-100", "")
         
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
             source_id_str = str(sid).replace("-100", "")
-            if source_id_str != msg_chat_str:
+            msg_id_str = str(source_chat_id).replace("-100", "")
+            
+            if source_id_str != msg_id_str:
                 continue
 
             # Topic Context Verification
@@ -2140,84 +1970,85 @@ async def process_automation_pipeline(client, messages, source_chat_id):
             if topic_filter_id is not None and str(msg_topic_anchor) != str(topic_filter_id):
                 continue
 
-            # Content Filter Validation Rules (Evaluated on per-message context)
+            # Content Filter Validation Rules
             cf_val = cf or "everything"
-            valid_messages = []
-            for msg in messages:
-                has_media = bool(msg.media)
-                if cf_val == "media" and not has_media: continue
-                if cf_val == "text" and has_media: continue
-                valid_messages.append(msg)
-                
-            if not valid_messages:
-                continue
+            if cf_val == "media" and not any(msg.media for msg in messages): continue
+            if cf_val == "text" and any(msg.media for msg in messages): continue
 
-            # Execution Step A: Database Logging Operations
+            # Execution Step A: Database Operations
             if is_mon:
                 with db_conn() as conn:
                     c = conn.cursor()
-                    for msg in valid_messages:
+                    for msg in messages:
                         m_type = get_specific_media_type(msg.media)
-                        rel_val = 1 if is_live else 0
                         if USING_POSTGRES:
                             c.execute(
-                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (%s, %s, %s, %s, %s, 'monitor', %s) ON CONFLICT DO NOTHING",
-                                (pid, sid, msg.id, m_type, msg.message or "", rel_val)
+                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'monitor') ON CONFLICT DO NOTHING",
+                                (pid, sid, msg.id, m_type, msg.message or "")
                             )
                         else:
                             c.execute(
-                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) VALUES (?, ?, ?, ?, ?, 'monitor', ?)",
-                                (pid, sid, msg.id, m_type, msg.message or "", rel_val)
+                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'monitor')",
+                                (pid, sid, msg.id, m_type, msg.message or "")
                             )
 
             # Execution Step B: Live Mirror/Forward Engine Routine
             if is_live:
-                is_reply = any(getattr(msg, 'reply_to_msg_id', None) for msg in valid_messages)
                 if is_protected_flow:
-                    has_media = any(m.media for m in valid_messages)
-                    if is_protected_flow and has_media and not any(m.id in media_to_file for m in valid_messages):
-                        logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} (Download Failed).")
+                    has_media = any(m.media for m in messages)
+                    if has_media and not downloaded_files:
+                        logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} because media download failed/skipped on protected chat.")
                     else:
-                        await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
+                        await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid, pre_downloaded=downloaded_files if has_media else None)
                 else:
-                    # Unrestricted flow: perform standard native forward safely
+                    # Unrestricted flow: perform standard Telegram forward!
                     try:
                         src_peer = await client.get_input_entity(int(sid))
                         tgt_peer = await client.get_input_entity(int(tid))
                         
                         dest_topic_id = t_topic
                         if is_mir:
-                            if msg_topic_anchor:
-                                forum = getattr(first_msg.reply_to, "forum_topic", None) if first_msg.reply_to else None
+                            source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or (first_msg.reply_to.reply_to_msg_id if first_msg.reply_to else None)
+                            if source_top:
+                                forum = getattr(first_msg.reply_to, "forum_topic", None)
                                 src_title = getattr(forum, "title", None)
                                 src_icon = None
                                 if not src_title:
                                     try:
                                         resolved_sid = await resolve_target_id(client, sid)
                                         res = await client(functions.messages.GetForumTopicsRequest(
-                                            peer=resolved_sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                            peer=resolved_sid,
+                                            offset_date=0,
+                                            offset_id=0,
+                                            offset_topic=0,
+                                            limit=100
                                         ))
                                         for t in res.topics:
-                                            if t.id == msg_topic_anchor:
+                                            if t.id == source_top:
                                                 src_title = t.title
                                                 src_icon = getattr(t, "icon_emoji_id", None)
                                                 break
                                     except Exception: pass
                                 
                                 if src_title:
-                                    dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, msg_topic_anchor, icon_emoji_id=src_icon)
+                                    logger.info(f"FORWARD: Resolving target topic for title: '{src_title}'")
+                                    dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
 
                         import random
-                        random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in valid_messages]
+                        random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in messages]
+                        
                         target_entity = await resolve_target_id(client, tid)
                         is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
                         
-                        top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
+                        top_msg_id_val = None
+                        if is_forum:
+                            top_msg_id_val = int(dest_topic_id) if dest_topic_id else None
                         
+                        # Native standard forward
                         fwd_res = await client(functions.messages.ForwardMessagesRequest(
                             from_peer=src_peer,
-                            id=[msg.id for msg in valid_messages],
-                            to_peer=target_entity,
+                            id=[msg.id for msg in messages],
+                            to_peer=tgt_peer,
                             random_id=random_ids,
                             top_msg_id=top_msg_id_val
                         ))
@@ -2229,55 +2060,61 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                                     if type(u).__name__ in ["UpdateNewMessage", "UpdateNewChannelMessage"]:
                                         fwd_msgs.append(u.message)
                             
-                            if len(fwd_msgs) == len(valid_messages):
-                                for orig_m, fwd_m in zip(valid_messages, fwd_msgs):
+                            if len(fwd_msgs) == len(messages):
+                                for orig_m, fwd_m in zip(messages, fwd_msgs):
                                     save_message_mapping(sid, orig_m.id, tid, fwd_m.id)
-                                    logger.info(f"✅ FORWARD: Native forward mapping established {orig_m.id} -> {fwd_m.id}")
+                                    logger.info(f"✅ FORWARD: Standard forwarded message {orig_m.id} -> Target {tid} (Msg ID: {fwd_m.id})")
                             else:
-                                logger.info(f"✅ FORWARD: Native forward successful across cluster from {sid}")
+                                logger.info(f"✅ FORWARD: Standard forwarded messages from source {sid} to target {tid}")
                                 
                     except Exception as fwd_err:
-                        logger.error(f"Native Forward dropped ({fwd_err}). Activating fallback downmirror...")
-                        await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid)
+                        logger.error(f"Failed standard forward from {sid} to {tid}: {fwd_err}. Falling back to custom mirror.")
+                        await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid)
 
             # Execution Step C: Backup Storage Vault Allocation
             if is_mon and not already_vaulted:
+                # Passes pre-downloaded files to log fleet avoiding a second round of downloads
                 if is_protected_flow:
-                    has_media = any(m.media for m in valid_messages)
+                    has_media = any(m.media for m in messages)
                     if has_media:
-                        files_to_vault = [media_to_file.get(m.id) or m.media for m in valid_messages if m.media]
-                        if files_to_vault:
-                            file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
+                        if not downloaded_files:
+                            logger.warning(f"🛡️ PIPELINE: Skipping vaulting because media download failed/skipped on protected chat.")
+                        else:
                             for token, username, bot_id in get_log_bots():
                                 metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
                                 caption_text = metadata + (first_msg.message or "")
                                 try:
                                     vaulted_result = await client.send_message(
                                         entity=int(bot_id),
-                                        file=file_payload,
+                                        file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
                                         message=caption_text
                                     )
                                     if vaulted_result:
                                         v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
                                         for i, v_m in enumerate(v_msgs):
-                                            if i < len(valid_messages):
-                                                orig_m = valid_messages[i]
-                                                save_logged_media(
-                                                    bot_id=int(bot_id), log_msg_id=int(v_m.id),
-                                                    source_chat_id=int(source_chat_id), source_msg_id=int(orig_m.id),
-                                                    file_id=None, media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                                                    caption=orig_m.message or "", grouped_id=orig_m.grouped_id
-                                                )
+                                            orig_m = messages[i]
+                                            save_logged_media(
+                                                bot_id=int(bot_id),
+                                                log_msg_id=int(v_m.id),
+                                                source_chat_id=int(source_chat_id),
+                                                source_msg_id=int(orig_m.id),
+                                                file_id=None,
+                                                media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                                                caption=orig_m.message or "",
+                                                grouped_id=orig_m.grouped_id
+                                            )
                                 except Exception as e:
-                                    logger.error(f"Error executing backup synchronization pipeline: {e}")
+                                    logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
                     else:
-                        asyncio.create_task(forward_to_log_bots(client, valid_messages, sid))
+                        # Text-only message on protected flow, or no media
+                        asyncio.create_task(forward_to_log_bots(client, messages, sid))
                 else:
-                    asyncio.create_task(forward_to_log_bots(client, valid_messages, sid))
+                    asyncio.create_task(forward_to_log_bots(client, messages, sid))
                 already_vaulted = True
 
     finally:
-        for temp_path in media_to_file.values():
+        # Strict memory-leak garbage collection cleanup 
+        for temp_path in downloaded_files:
             if os.path.exists(temp_path):
                 try: os.remove(temp_path)
                 except Exception: pass
@@ -2321,7 +2158,7 @@ def setup_automation_handlers(client: TelegramClient):
                         if allow_destructive:
                             try:
                                 # Standard forward is blocked by server, so we decrypt and download locally first
-                                temp_path = await client.download_media(m)
+                                temp_path = await client.download_media(m.media)
                                 if temp_path:
                                     for tid in target_ids:
                                         try:
@@ -2842,23 +2679,11 @@ def setup_automation_handlers(client: TelegramClient):
                 
                 # Consolidated delayed task that processes all rules sequentially
                 async def delayed_send_album(gid, s_id):
-                    await asyncio.sleep(2.5)  # Time window optimization
+                    await asyncio.sleep(3.5)  # Slightly reduced to stay well inside the update loop
                     messages = album_cache.pop(gid, [])
                     if not messages: return
                     
-                    # Prevent identical racing handler updates from repeating pipeline execution
-                    lock_key = f"{s_id}_{gid}"
-                    if lock_key in album_processing_lock:
-                        return
-                    album_processing_lock.add(lock_key)
-                    
-                    try:
-                        # Sort sequentially by message entry indexes
-                        messages.sort(key=lambda x: x.id)
-                        await process_automation_pipeline(client, messages, s_id)
-                    finally:
-                        # Safely clean garbage parameters and release loop execution tokens
-                        album_processing_lock.discard(lock_key)
+                    await process_automation_pipeline(client, messages, s_id)
                 
                 asyncio.create_task(delayed_send_album(m.grouped_id, m.chat_id))
             else:
@@ -3971,166 +3796,6 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id, "🚀 Starting Collection...")
         asyncio.run_coroutine_threadsafe(run_collection(call.message.chat.id, pid), loop)
 
-    elif data.startswith("pair_coll_toggle_"):
-        parts = data.split("_")
-        # Structure: pair_coll_toggle_{pair_id}_{mode}
-        pid = int(parts[3])
-        mode = parts[4]
-        task_key = f"coll_{pid}"
-        
-        # Check if task is running
-        if task_key not in running_tasks or not running_tasks[task_key]:
-            bot.answer_callback_query(call.id, "❌ Collection is not currently running.")
-            return
-            
-        instant_rel = (mode == "instant")
-        opts = collection_options.setdefault(task_key, {})
-        opts["instant_release"] = instant_rel
-        if "instant_filter" not in opts:
-            opts["instant_filter"] = "everything"
-            
-        status_text = "⚡ Instant Release Enabled" if instant_rel else "📥 Hold Release Enabled"
-        bot.answer_callback_query(call.id, status_text)
-        
-        # Reconstruct the message text using saved states if available
-        if "s_title" in opts:
-            s_title = opts["s_title"]
-            scanned = opts["scanned"]
-            collected = opts["collected"]
-            limit = opts["limit"]
-            sent_count = opts["sent_count"]
-            instant_filter = opts.get("instant_filter", "everything")
-            
-            l_text = f" / {limit}" if limit else ""
-            sent_label = f"`{sent_count}`" if instant_rel else f"`{sent_count} (Hold)`"
-            if instant_rel:
-                f_map = {"everything": "All", "media": "Media Only", "text": "Text Only"}
-                sent_label += f" ({f_map.get(instant_filter, 'All')})"
-            
-            try:
-                bot.edit_message_text(
-                    f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: {sent_label}",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=get_collection_markup(pid),
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                logger.error(f"Error editing message text in toggle callback: {e}")
-        else:
-            try:
-                bot.edit_message_reply_markup(
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=get_collection_markup(pid)
-                )
-            except Exception as e:
-                logger.error(f"Error editing reply markup in toggle callback: {e}")
-
-    elif data.startswith("pair_coll_filter_"):
-        pid = int(data.split("_")[-1])
-        task_key = f"coll_{pid}"
-        
-        # Check if task is running
-        if task_key not in running_tasks or not running_tasks[task_key]:
-            bot.answer_callback_query(call.id, "❌ Collection is not currently running.")
-            return
-            
-        opts = collection_options.setdefault(task_key, {})
-        current = opts.get("instant_filter", "everything")
-        next_filter = "media" if current == "everything" else "text" if current == "media" else "everything"
-        opts["instant_filter"] = next_filter
-        
-        bot.answer_callback_query(call.id, f"🎯 Filter: {next_filter.title()}")
-        
-        # Reconstruct the message text using saved states if available
-        if "s_title" in opts:
-            s_title = opts["s_title"]
-            scanned = opts["scanned"]
-            collected = opts["collected"]
-            limit = opts["limit"]
-            sent_count = opts["sent_count"]
-            curr_instant = opts.get("instant_release", False)
-            
-            l_text = f" / {limit}" if limit else ""
-            sent_label = f"`{sent_count}`" if curr_instant else f"`{sent_count} (Hold)`"
-            if curr_instant:
-                f_map = {"everything": "All", "media": "Media Only", "text": "Text Only"}
-                sent_label += f" ({f_map.get(next_filter, 'All')})"
-            
-            try:
-                bot.edit_message_text(
-                    f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: {sent_label}",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=get_collection_markup(pid),
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                logger.error(f"Error editing message text in filter callback: {e}")
-        else:
-            try:
-                bot.edit_message_reply_markup(
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=get_collection_markup(pid)
-                )
-            except Exception as e:
-                logger.error(f"Error editing reply markup in filter callback: {e}")
-
-    elif data.startswith("pair_coll_cfilter_"):
-        pid = int(data.split("_")[-1])
-        task_key = f"coll_{pid}"
-        
-        # Check if task is running
-        if task_key not in running_tasks or not running_tasks[task_key]:
-            bot.answer_callback_query(call.id, "❌ Collection is not currently running.")
-            return
-            
-        opts = collection_options.setdefault(task_key, {})
-        current = opts.get("collect_filter", "everything")
-        # Cycle through: everything -> media -> text -> file -> everything
-        next_filter = "media" if current == "everything" else "text" if current == "media" else "file" if current == "text" else "everything"
-        opts["collect_filter"] = next_filter
-        
-        bot.answer_callback_query(call.id, f"📥 Collect Filter: {next_filter.title()}")
-        
-        # Reconstruct the message text using saved states if available
-        if "s_title" in opts:
-            s_title = opts["s_title"]
-            scanned = opts["scanned"]
-            collected = opts["collected"]
-            limit = opts["limit"]
-            sent_count = opts["sent_count"]
-            curr_instant = opts.get("instant_release", False)
-            curr_filter = opts.get("instant_filter", "everything")
-            
-            l_text = f" / {limit}" if limit else ""
-            sent_label = f"`{sent_count}`" if curr_instant else f"`{sent_count} (Hold)`"
-            if curr_instant:
-                f_map = {"everything": "All", "media": "Media Only", "text": "Text Only"}
-                sent_label += f" ({f_map.get(curr_filter, 'All')})"
-            
-            try:
-                bot.edit_message_text(
-                    f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: {sent_label}",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=get_collection_markup(pid),
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                logger.error(f"Error editing message text in collect filter callback: {e}")
-        else:
-            try:
-                bot.edit_message_reply_markup(
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=get_collection_markup(pid)
-                )
-            except Exception as e:
-                logger.error(f"Error editing reply markup in collect filter callback: {e}")
-
     elif data.startswith("pair_release_"):
         pid = int(data.split("_")[-1])
         bot.answer_callback_query(call.id)
@@ -4154,44 +3819,24 @@ def handle_callbacks(call):
         pid = int(parts[4])
         bot.answer_callback_query(call.id)
         
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("⚡ Instant Release", callback_data=f"pair_rel_now_{source_type}_{pid}"),
+            InlineKeyboardButton("⏰ Scheduled (Slow)", callback_data=f"pair_rel_slow_{source_type}_{pid}")
+        )
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"pair_release_{pid}"))
+        
         m_names = {"monitor": "Monitor 👁️", "scraper": "History Scraper 📜", "collection": "Collect Now 📥"}
         display_name = m_names.get(source_type, "Vault Items")
-        bot.edit_message_text(f"🚀 *Release Engine: {display_name}*\n\nChoose release mode:", call.message.chat.id, call.message.message_id, reply_markup=get_release_markup(pid, source_type), parse_mode="Markdown")
-
-    elif data.startswith("pair_rel_filter_"):
-        parts = data.split("_")
-        # Structure: pair_rel_filter_{source_type}_{pid}
-        source_type = parts[3]
-        pid = int(parts[4])
-        
-        key = f"{pid}_{source_type}"
-        current = release_options.setdefault(key, "everything")
-        next_filter = "media" if current == "everything" else "text" if current == "media" else "everything"
-        release_options[key] = next_filter
-        
-        bot.answer_callback_query(call.id, f"🎯 Release Filter: {next_filter.title()}")
-        
-        try:
-            bot.edit_message_reply_markup(
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=get_release_markup(pid, source_type)
-            )
-        except Exception as e:
-            logger.error(f"Error updating release markup: {e}")
+        bot.edit_message_text(f"🚀 *Release Engine: {display_name}*\n\nChoose release mode:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
     elif data.startswith("pair_rel_now_"):
         parts = data.split("_")
         # Structure: pair_rel_now_{source_type}_{pid}
         source_type = parts[3]
         pid = int(parts[4])
-        
-        # Get chosen release filter
-        key = f"{pid}_{source_type}"
-        release_filter = release_options.get(key, "everything")
-        
         bot.answer_callback_query(call.id, f"🚀 Starting Instant Release...")
-        asyncio.run_coroutine_threadsafe(run_release(call.message.chat.id, pid, added_by=source_type, interval=1.5, release_filter=release_filter), loop)
+        asyncio.run_coroutine_threadsafe(run_release(call.message.chat.id, pid, added_by=source_type, interval=1.5), loop)
         asyncio.run_coroutine_threadsafe(show_pair_view(call.message.chat.id, call.message.message_id, pid), loop)
 
     elif data.startswith("pair_rel_slow_"):
@@ -4199,13 +3844,8 @@ def handle_callbacks(call):
         # Structure: pair_rel_slow_{source_type}_{pid}
         source_type = parts[3]
         pid = int(parts[4])
-        
-        # Get chosen release filter
-        key = f"{pid}_{source_type}"
-        release_filter = release_options.get(key, "everything")
-        
         bot.answer_callback_query(call.id)
-        admin_states[uid] = f"rel_src_setup_interval_{source_type}_{pid}_{release_filter}"
+        admin_states[uid] = f"rel_src_setup_interval_{source_type}_{pid}"
         bot.send_message(call.message.chat.id, "⏰ *Slow Release Setup*\n\nEnter the *interval* between items in seconds:\n(Example: `60` for 1 minute, `300` for 5 minutes)")
     elif data.startswith("pair_delete_confirm_"):
         pid = int(data.split("_")[-1])
@@ -4477,14 +4117,10 @@ def handle_state_inputs(message):
         asyncio.run_coroutine_threadsafe(verify_password_task(), loop)
 
     elif state.startswith("rel_src_setup_interval_"):
-        # Format: rel_src_setup_interval_{source_type}_{pid}_{filter}
+        # Format: rel_src_setup_interval_{source_type}_{pid}
         parts = state.split("_")
         source_type = parts[4]
         pid = int(parts[5])
-        release_filter = "everything"
-        if len(parts) > 6:
-            release_filter = parts[6]
-            
         if not text.isdigit():
             bot.reply_to(message, "Please send a valid number.")
             return
@@ -4494,20 +4130,16 @@ def handle_state_inputs(message):
         m_names = {"monitor": "Monitoring", "scraper": "History Scraper", "collection": "Collect Now"}
         display_name = m_names.get(source_type, "Vault Items")
         
-        f_names = {"everything": "All Content 🔄", "media": "Media Only 🖼️", "text": "Text Only 📝"}
-        display_filter = f_names.get(release_filter, "All Content 🔄")
-        
         bot.send_message(
             message.chat.id, 
             f"⏳ **Slow Release Initiated**\n\n"
             f"🎯 **Target Pair ID:** `{pid}`\n"
             f"📥 **Collection Source:** `{display_name}`\n"
-            f"🎯 **Release Filter:** `{display_filter}`\n"
             f"⏰ **Release Interval:** `{interval}s` between items\n\n"
             f"🚀 *Engine running in background...*",
             parse_mode="Markdown"
         )
-        asyncio.run_coroutine_threadsafe(run_release(message.chat.id, pid, added_by=source_type, interval=interval, release_filter=release_filter), loop)
+        asyncio.run_coroutine_threadsafe(run_release(message.chat.id, pid, added_by=source_type, interval=interval), loop)
     elif state.startswith("hist_setup_count_only_"):
         pid = int(state.split("_")[-1])
         if not text.isdigit():
@@ -4651,16 +4283,6 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
 
         # Check if protected flow
         is_protected_flow = getattr(target_chat, 'noforwards', False)
-        if is_protected_flow:
-            try:
-                from telethon.tl.functions.channels import GetChannelsRequest
-                res = await userbot(GetChannelsRequest(id=[target_chat]))
-                if res and res.chats:
-                    target_chat = res.chats[0]
-                    is_protected_flow = getattr(target_chat, 'noforwards', False)
-                    update_telethon_entity_cache(userbot, target_chat)
-            except Exception:
-                pass
 
         # Forward the batches chronologically to the target group and vault them if needed
         for batch in grouped_batches:
@@ -4669,21 +4291,21 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 break
 
             # Pre-download files safely if the chat is restricted/protected
-            media_to_file = {}
+            downloaded_files = []
             if is_protected_flow:
                 for msg in batch:
                     if msg.media:
                         try:
-                            path = await userbot.download_media(msg)
+                            path = await userbot.download_media(msg.media)
                             if path:
-                                media_to_file[msg.id] = path
+                                downloaded_files.append(path)
                         except errors.FloodWaitError as fwe:
                             logger.warning(f"⏳ SCRAPE FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
                             if fwe.seconds <= 5:
                                 await asyncio.sleep(fwe.seconds)
                                 try:
-                                    path = await userbot.download_media(msg)
-                                    if path: media_to_file[msg.id] = path
+                                    path = await userbot.download_media(msg.media)
+                                    if path: downloaded_files.append(path)
                                 except Exception as e2:
                                     logger.error(f"Failed to download media after short flood wait: {e2}")
                         except Exception as e:
@@ -4693,10 +4315,10 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 # Forward directly to target group
                 has_media = any(msg.media for msg in batch)
                 if is_protected_flow:
-                    if has_media and not any(msg.id in media_to_file for msg in batch):
+                    if has_media and not downloaded_files:
                         logger.warning("🛡️ SCRAPE: Skipping mirror because media download failed/skipped.")
                     else:
-                        await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved, pre_downloaded=[media_to_file[msg.id] for msg in batch if msg.id in media_to_file] if (is_protected_flow and has_media) else None)
+                        await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved, pre_downloaded=downloaded_files if has_media else None)
                 else:
                     await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved)
                 
@@ -4704,79 +4326,52 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 
                 # Vaulting / Log bots logic if enabled
                 if is_mon:
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        for m in batch:
-                            if m.media:
-                                m_type = type(m.media).__name__
+                    for m in batch:
+                        if m.media:
+                            m_type = type(m.media).__name__
+                            with db_conn() as conn:
+                                c = conn.cursor()
                                 if USING_POSTGRES:
                                     c.execute(
-                                        """
-                                        INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) 
-                                        VALUES (%s, %s, %s, %s, %s, 'scraper', 1) 
-                                        ON CONFLICT (source_chat_id, source_message_id) 
-                                        DO UPDATE SET 
-                                            pair_id = EXCLUDED.pair_id,
-                                            media_type = EXCLUDED.media_type,
-                                            caption = EXCLUDED.caption,
-                                            added_by = EXCLUDED.added_by,
-                                            released = EXCLUDED.released,
-                                            timestamp = CURRENT_TIMESTAMP
-                                        """,
+                                        "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (%s, %s, %s, %s, %s, 'collection') ON CONFLICT DO NOTHING",
                                         (pair_id, sid_resolved, m.id, m_type, m.message or "")
                                     )
                                 else:
                                     c.execute(
-                                        """
-                                        INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) 
-                                        VALUES (?, ?, ?, ?, ?, 'scraper', 1) 
-                                        ON CONFLICT (source_chat_id, source_message_id) 
-                                        DO UPDATE SET 
-                                            pair_id = excluded.pair_id,
-                                            media_type = excluded.media_type,
-                                            caption = excluded.caption,
-                                            added_by = excluded.added_by,
-                                            released = excluded.released,
-                                            timestamp = datetime('now')
-                                        """,
+                                        "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by) VALUES (?, ?, ?, ?, ?, 'collection')",
                                         (pair_id, sid_resolved, m.id, m_type, m.message or "")
                                     )
-                        if not USING_POSTGRES or not DATABASE_URL:
-                            conn.commit()
                     
-                    if is_protected_flow:
-                        files_to_vault = [media_to_file.get(m.id) for m in batch if m.id in media_to_file]
-                        if files_to_vault:
-                            file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
-                            for token, username, bot_id in get_log_bots():
-                                metadata = f"SID: {sid_resolved} | MID: {batch[0].id}\n"
-                                caption_text = metadata + (batch[0].message or "")
-                                try:
-                                    vaulted_result = await userbot.send_message(
-                                        entity=int(bot_id),
-                                        file=file_payload,
-                                        message=caption_text
-                                    )
-                                    if vaulted_result:
-                                        v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
-                                        for i, v_m in enumerate(v_msgs):
-                                            orig_m = batch[i]
-                                            save_logged_media(
-                                                bot_id=int(bot_id),
-                                                log_msg_id=int(v_m.id),
-                                                source_chat_id=int(sid_resolved),
-                                                source_msg_id=int(orig_m.id),
-                                                file_id=None,
-                                                media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                                                caption=orig_m.message or "",
-                                                grouped_id=orig_m.grouped_id
-                                            )
-                                except Exception as e:
-                                    logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
-                    else:
+                    if is_protected_flow and downloaded_files:
+                        for token, username, bot_id in get_log_bots():
+                            metadata = f"SID: {sid_resolved} | MID: {batch[0].id}\n"
+                            caption_text = metadata + (batch[0].message or "")
+                            try:
+                                vaulted_result = await userbot.send_message(
+                                    entity=int(bot_id),
+                                    file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
+                                    message=caption_text
+                                )
+                                if vaulted_result:
+                                    v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+                                    for i, v_m in enumerate(v_msgs):
+                                        orig_m = batch[i]
+                                        save_logged_media(
+                                            bot_id=int(bot_id),
+                                            log_msg_id=int(v_m.id),
+                                            source_chat_id=int(sid_resolved),
+                                            source_msg_id=int(orig_m.id),
+                                            file_id=None,
+                                            media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                                            caption=orig_m.message or "",
+                                            grouped_id=orig_m.grouped_id
+                                        )
+                            except Exception as e:
+                                logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                    elif not is_protected_flow or not has_media:
                         asyncio.create_task(forward_to_log_bots(userbot, batch, sid_resolved))
             finally:
-                for temp_path in media_to_file.values():
+                for temp_path in downloaded_files:
                     if os.path.exists(temp_path):
                         try: os.remove(temp_path)
                         except Exception: pass
@@ -4832,7 +4427,7 @@ async def resolve_target_id(client: TelegramClient, target_ref):
 
     raise ValueError(f"Could not find or access chat: {target_ref}")
 
-async def run_collection(admin_chat_id, pair_id, limit=None):
+async def run_collection(admin_chat_id, pair_id, limit=300):
     is_ok, msg = await ensure_userbot()
     if not is_ok:
         bot.send_message(admin_chat_id, f"❌ Userbot error: {msg}")
@@ -4848,37 +4443,14 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
     collected = 0
     scanned = 0
     sent_count = 0
-    
-    default_cf = cf or "everything"
-    if default_cf not in ["everything", "media", "text", "file"]:
-        default_cf = "everything"
-        
-    # Initialize collection options default state
-    collection_options[task_key] = {
-        "instant_release": False,
-        "instant_filter": "everything",
-        "collect_filter": default_cf,
-        "s_title": s_title,
-        "scanned": 0,
-        "collected": 0,
-        "limit": limit,
-        "sent_count": 0
-    }
-    
-    status_msg = bot.send_message(
-        admin_chat_id, 
-        f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `0`\n📥 Collected: `0`\n📤 Sent: `0 (Hold)`", 
-        reply_markup=get_collection_markup(pair_id), 
-        parse_mode="Markdown"
-    )
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}"))
+    status_msg = bot.send_message(admin_chat_id, f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `0`\n📥 Collected: `0`\n📤 Sent: `0`", reply_markup=markup, parse_mode="Markdown")
     
     try:
         # Force peer resolution (Anti PeerIdInvalid)
-        source_chat = await resolve_target_id(userbot, sid)
-        sid_resolved = source_chat.id
-        
-        dest_chat = await resolve_target_id(userbot, tid)
-        tid_resolved = dest_chat.id
+        target_chat = await resolve_target_id(userbot, sid)
+        sid_resolved = target_chat.id
         
         # Telethon uses iter_messages for history (newest to oldest)
         target_topic = None
@@ -4902,43 +4474,24 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
             if is_user_banned(sender_id, sender_username):
                 continue
 
-            # Content type filter (dynamic based on collect_filter option)
-            opts_current = collection_options.get(task_key, {})
-            cf_val = opts_current.get("collect_filter", "everything")
-            
-            m_type = get_specific_media_type(m.media)
-            if cf_val == "media" and m_type not in ["photo", "video"]:
+            # Content type filter
+            cf_val = cf or "everything"
+            if cf_val == "media" and not m.media:
                 continue
-            if cf_val == "text" and m_type != "text":
-                continue
-            if cf_val == "file" and m_type != "file":
+            if cf_val == "text" and m.media:
                 continue
 
             collected_messages.append(m)
             collected += 1
             
-            # Update options progress for UI toggle callback
-            opts = collection_options.setdefault(task_key, {})
-            opts.update({
-                "scanned": scanned,
-                "collected": collected,
-                "sent_count": sent_count
-            })
-            curr_instant = opts.get("instant_release", False)
-            curr_filter = opts.get("instant_filter", "everything")
-            
             if scanned % 50 == 0:
                 l_text = f" / {limit}" if limit else ""
-                sent_label = f"`{sent_count}`" if curr_instant else f"`{sent_count} (Hold)`"
-                if curr_instant:
-                    f_map = {"everything": "All", "media": "Media Only", "text": "Text Only"}
-                    sent_label += f" ({f_map.get(curr_filter, 'All')})"
                 try:
                     bot.edit_message_text(
-                        f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: {sent_label}",
+                        f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: `{sent_count}`",
                         admin_chat_id,
                         status_msg.message_id,
-                        reply_markup=get_collection_markup(pair_id),
+                        reply_markup=markup,
                         parse_mode="Markdown"
                     )
                 except Exception:
@@ -4976,17 +4529,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         auto_mirror = is_mir
 
         # Check if protected flow
-        is_protected_flow = getattr(source_chat, 'noforwards', False)
-        if is_protected_flow:
-            try:
-                from telethon.tl.functions.channels import GetChannelsRequest
-                res = await userbot(GetChannelsRequest(id=[source_chat]))
-                if res and res.chats:
-                    source_chat = res.chats[0]
-                    is_protected_flow = getattr(source_chat, 'noforwards', False)
-                    update_telethon_entity_cache(userbot, source_chat)
-            except Exception:
-                pass
+        is_protected_flow = getattr(target_chat, 'noforwards', False)
 
         # Save and forward both normally and through vault
         for batch in grouped_batches:
@@ -4994,169 +4537,99 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 bot.send_message(admin_chat_id, f"🛑 Collection forwarding stopped by user.")
                 break
 
-            # Read dynamic option for this iteration
-            opts = collection_options.setdefault(task_key, {})
-            curr_instant = opts.get("instant_release", False)
-            instant_filter = opts.get("instant_filter", "everything")
-
-            # Filter batch content based on instant_filter
-            matching_batch = []
-            skipped_batch = []
-            
-            for msg in batch:
-                matches = True
-                if instant_filter == "media" and not msg.media:
-                    matches = False
-                elif instant_filter == "text" and msg.media:
-                    matches = False
-                    
-                if matches:
-                    matching_batch.append(msg)
-
-            # Pre-download files safely if the chat is restricted/protected and we are instantly releasing
-            media_to_file = {}
-            if curr_instant and is_protected_flow and matching_batch:
-                for msg in matching_batch:
+            # Pre-download files safely if the chat is restricted/protected
+            downloaded_files = []
+            if is_protected_flow:
+                for msg in batch:
                     if msg.media:
                         try:
-                            path = await userbot.download_media(msg)
+                            path = await userbot.download_media(msg.media)
                             if path:
-                                media_to_file[msg.id] = path
+                                downloaded_files.append(path)
                         except errors.FloodWaitError as fwe:
                             logger.warning(f"⏳ COLLECTION FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
                             if fwe.seconds <= 5:
                                 await asyncio.sleep(fwe.seconds)
                                 try:
-                                    path = await userbot.download_media(msg)
-                                    if path: media_to_file[msg.id] = path
+                                    path = await userbot.download_media(msg.media)
+                                    if path: downloaded_files.append(path)
                                 except Exception as e2:
                                     logger.error(f"Failed to download media after short flood wait: {e2}")
                         except Exception as e:
                             logger.error(f"Failed to download media for message {msg.id}: {e}")
 
             try:
-                # 1. Forward directly to target group (Normally) if instant release is active
-                if curr_instant and matching_batch:
-                    has_media = any(msg.media for msg in matching_batch)
-                    if is_protected_flow:
-                        if has_media and not any(msg.id in media_to_file for msg in matching_batch):
-                            logger.warning("🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
-                        else:
-                            await send_mirrored_content(userbot, tid_resolved, matching_batch, t_topic, auto_mirror, sid_resolved, pre_downloaded=[media_to_file[msg.id] for msg in matching_batch if msg.id in media_to_file] if (is_protected_flow and has_media) else None)
+                # 1. Forward directly to target group (Normally)
+                has_media = any(msg.media for msg in batch)
+                if is_protected_flow:
+                    if has_media and not downloaded_files:
+                        logger.warning("🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
                     else:
-                        await send_mirrored_content(userbot, tid_resolved, matching_batch, t_topic, auto_mirror, sid_resolved)
-                    
-                    sent_count += len(matching_batch)
+                        await send_mirrored_content(userbot, tid, batch, t_topic, auto_mirror, sid_resolved, pre_downloaded=downloaded_files if has_media else None)
+                else:
+                    await send_mirrored_content(userbot, tid, batch, t_topic, auto_mirror, sid_resolved)
                 
-                # 2. Save to database
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    for m in batch:
-                        m_type = get_specific_media_type(m.media)
-                        # Determine release status for this specific message
-                        if curr_instant:
-                            matches = True
-                            if instant_filter == "media" and not m.media:
-                                matches = False
-                            elif instant_filter == "text" and m.media:
-                                matches = False
-                            rel_val = 1 if matches else 0
-                        else:
-                            rel_val = 0
-
+                sent_count += len(batch)
+                
+                # 2. Vaulting / Save to database
+                for m in batch:
+                    m_type = get_specific_media_type(m.media)
+                    with db_conn() as conn:
+                        c = conn.cursor()
                         if USING_POSTGRES:
                             c.execute(
-                                """
-                                INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) 
-                                VALUES (%s, %s, %s, %s, %s, 'collection', %s) 
-                                ON CONFLICT (source_chat_id, source_message_id) 
-                                DO UPDATE SET 
-                                    pair_id = EXCLUDED.pair_id,
-                                    media_type = EXCLUDED.media_type,
-                                    caption = EXCLUDED.caption,
-                                    added_by = EXCLUDED.added_by,
-                                    released = EXCLUDED.released,
-                                    timestamp = CURRENT_TIMESTAMP
-                                """,
-                                (pair_id, sid_resolved, m.id, m_type, m.message or "", rel_val)
+                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                                (pair_id, sid_resolved, m.id, m_type, m.message or "")
                             )
                         else:
                             c.execute(
-                                """
-                                INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) 
-                                VALUES (?, ?, ?, ?, ?, 'collection', ?) 
-                                ON CONFLICT (source_chat_id, source_message_id) 
-                                DO UPDATE SET 
-                                    pair_id = excluded.pair_id,
-                                    media_type = excluded.media_type,
-                                    caption = excluded.caption,
-                                    added_by = excluded.added_by,
-                                    released = excluded.released,
-                                    timestamp = datetime('now')
-                                """,
-                                (pair_id, sid_resolved, m.id, m_type, m.message or "", rel_val)
+                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                                (pair_id, sid_resolved, m.id, m_type, m.message or "")
                             )
-                    conn.commit()
-                # 3. Send to log bots (through Vault) if instant release is active and matching_batch exists
-                if curr_instant and matching_batch:
-                    has_media = any(msg.media for msg in matching_batch)
-                    if is_protected_flow:
-                        files_to_vault = [media_to_file.get(m.id) for m in matching_batch if m.id in media_to_file]
-                        if files_to_vault:
-                            file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
-                            for token, username, bot_id in get_log_bots():
-                                metadata = f"SID: {sid_resolved} | MID: {matching_batch[0].id}\n"
-                                caption_text = metadata + (matching_batch[0].message or "")
-                                try:
-                                    vaulted_result = await userbot.send_message(
-                                        entity=int(bot_id),
-                                        file=file_payload,
-                                        message=caption_text
+                
+                # 3. Send to log bots (through Vault)
+                if is_protected_flow and downloaded_files:
+                    for token, username, bot_id in get_log_bots():
+                        metadata = f"SID: {sid_resolved} | MID: {batch[0].id}\n"
+                        caption_text = metadata + (batch[0].message or "")
+                        try:
+                            vaulted_result = await userbot.send_message(
+                                entity=int(bot_id),
+                                file=downloaded_files if len(downloaded_files) > 1 else downloaded_files[0],
+                                message=caption_text
+                            )
+                            if vaulted_result:
+                                v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+                                for i, v_m in enumerate(v_msgs):
+                                    orig_m = batch[i]
+                                    save_logged_media(
+                                        bot_id=int(bot_id),
+                                        log_msg_id=int(v_m.id),
+                                        source_chat_id=int(sid_resolved),
+                                        source_msg_id=int(orig_m.id),
+                                        file_id=None,
+                                        media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                                        caption=orig_m.message or "",
+                                        grouped_id=orig_m.grouped_id
                                     )
-                                    if vaulted_result:
-                                        v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
-                                        for i, v_m in enumerate(v_msgs):
-                                            orig_m = matching_batch[i]
-                                            save_logged_media(
-                                                bot_id=int(bot_id),
-                                                log_msg_id=int(v_m.id),
-                                                source_chat_id=int(sid_resolved),
-                                                source_msg_id=int(orig_m.id),
-                                                file_id=None,
-                                                media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                                                caption=orig_m.message or "",
-                                                grouped_id=orig_m.grouped_id
-                                            )
-                                except Exception as e:
-                                    logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
-                    else:
-                        asyncio.create_task(forward_to_log_bots(userbot, matching_batch, sid_resolved))
+                        except Exception as e:
+                            logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                elif not is_protected_flow or not has_media:
+                    asyncio.create_task(forward_to_log_bots(userbot, batch, sid_resolved))
             finally:
-                for temp_path in media_to_file.values():
+                for temp_path in downloaded_files:
                     if os.path.exists(temp_path):
                         try: os.remove(temp_path)
                         except Exception: pass
                 
-            # Update progress options for live callback queries
-            opts = collection_options.setdefault(task_key, {})
-            opts.update({
-                "sent_count": sent_count
-            })
-            curr_instant = opts.get("instant_release", False)
-            curr_filter = opts.get("instant_filter", "everything")
-
             # Edit status message
             l_text = f" / {limit}" if limit else ""
-            sent_label = f"`{sent_count}`" if curr_instant else f"`{sent_count} (Hold)`"
-            if curr_instant:
-                f_map = {"everything": "All", "media": "Media Only", "text": "Text Only"}
-                sent_label += f" ({f_map.get(curr_filter, 'All')})"
             try:
                 bot.edit_message_text(
-                    f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: {sent_label}",
+                    f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n📤 Sent: `{sent_count}`",
                     admin_chat_id,
                     status_msg.message_id,
-                    reply_markup=get_collection_markup(pair_id),
+                    reply_markup=markup,
                     parse_mode="Markdown"
                 )
             except Exception:
@@ -5164,20 +4637,13 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 
             await asyncio.sleep(0.5) # Flood wait safety buffer
 
-        opts = collection_options.setdefault(task_key, {})
-        curr_instant = opts.get("instant_release", False)
-        instant_filter = opts.get("instant_filter", "everything")
-        f_map = {"everything": "All Content", "media": "Media Only", "text": "Text Only"}
-        f_label = f" matching {f_map.get(instant_filter, 'All Content')} 🔄" if curr_instant else ""
-        sent_label = f"Sent to Target: `{sent_count}`{f_label}" if curr_instant else f"Sent to Target: `{sent_count} (Hold Mode)`"
-        bot.send_message(admin_chat_id, f"✅ Collection Done: `{s_title}`\nScanned: `{scanned}`\nCollected & Saved: `{collected}`\n{sent_label}")
+        bot.send_message(admin_chat_id, f"✅ Collection Done: `{s_title}`\nScanned: `{scanned}`\nCollected & Saved: `{collected}`\nSent to Target: `{sent_count}`")
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
     finally:
         running_tasks.pop(task_key, None)
-        collection_options.pop(task_key, None)
 
-async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, release_filter="everything"):
+async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2):
     is_ok, msg = await ensure_userbot()
     if not is_ok:
         bot.send_message(admin_chat_id, f"❌ Userbot error: {msg}")
@@ -5230,26 +4696,14 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
         sent = 0
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{added_by}_{pair_id}" if added_by else f"pair_stop_task_rel_{pair_id}"))
+        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items from {category_name}...", reply_markup=markup)
         
-        f_names = {"everything": "All Content 🔄", "media": "Media Only 🖼️", "text": "Text Only 📝"}
-        display_filter = f_names.get(release_filter, "All Content 🔄")
-        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items from {category_name}...\n🎯 Filter: `{display_filter}`", reply_markup=markup)
-        
-        idx = 0
-        while idx < len(items):
+        for row_id, smid in items:
             if not running_tasks.get(task_key): break
-            row_id, smid = items[idx]
             
-            advance = True
             try:
-                msg = await userbot.get_messages(source_chat, ids=smid)
-                if not msg:
-                    # Message is deleted/empty, mark it as inaccessible/skipped so we don't loop on it
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        p = get_placeholder()
-                        c.execute(f"UPDATE collected_media SET released = 2 WHERE id = {p}", (row_id,))
-                    continue
+                msg = await userbot.get_messages(sid_ref, ids=smid)
+                if not msg: continue
 
                 # --- CONTENT FILTERING ---
                 cf = cf or "everything"
@@ -5267,20 +4721,19 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                         c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
                     continue
 
-                # --- DYNAMIC RELEASE FILTERING ---
-                # Check message against dynamic release filter: if it doesn't match, we skip
-                # sending but keep it in the database as unreleased (released = 0) for future release runs.
-                if release_filter == "media" and not msg.media:
-                    continue
-                if release_filter == "text" and msg.media:
-                    continue
-
                 target_topic_anchor = t_topic
                 
                 # Determine if BOTH chats are forums to automatically mirror topics
                 auto_mirror = False
-                if getattr(source_chat, 'forum', False) and getattr(target_chat, 'forum', False):
-                    auto_mirror = True
+                try:
+                    real_sid = sid_ref if str(sid_ref).startswith("-100") else int(f"-100{str(sid_ref).replace('-100', '')}")
+                    real_tid = tid_ref if str(tid_ref).startswith("-100") else int(f"-100{str(tid_ref).replace('-100', '')}")
+                    src_ent = await userbot.get_entity(real_sid)
+                    tgt_ent = await userbot.get_entity(real_tid)
+                    if getattr(src_ent, 'forum', False) and getattr(tgt_ent, 'forum', False):
+                        auto_mirror = True
+                except Exception:
+                    pass
 
                 # Handle Mirroring ID detection for release
                 if auto_mirror:
@@ -5351,7 +4804,13 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                             try:
                                 local_file = await userbot.download_media(msg)
                             except errors.FloodWaitError as fwe:
-                                raise fwe
+                                logger.warning(f"⏳ RELEASE FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping this item.")
+                                if fwe.seconds <= 5:
+                                    await asyncio.sleep(fwe.seconds)
+                                    try:
+                                        local_file = await userbot.download_media(msg)
+                                    except Exception as e2:
+                                        logger.error(f"Failed to download in release after short wait: {e2}")
                             except Exception as de:
                                 logger.error(f"Failed to download media in release fallback: {de}")
                             if local_file:
@@ -5410,41 +4869,13 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                         c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
                 sent += 1
                 if sent % 5 == 0:
-                    try: bot.edit_message_text(f"🚀 Releasing `{s_title}` ({category_name})...\n🎯 Filter: `{display_filter}`\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
+                    try: bot.edit_message_text(f"🚀 Releasing `{s_title}` ({category_name})...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
                     except Exception: pass
                 await asyncio.sleep(interval)
-            except errors.FloodWaitError as fwe:
-                logger.warning(f"⏳ RELEASE FLOOD: A wait of {fwe.seconds} seconds is required. Sleeping...")
-                try:
-                    bot.edit_message_text(
-                        f"⏳ *Release Rate-Limited*\n\nWaiting `{fwe.seconds}` seconds before retrying message ID `{smid}`...",
-                        admin_chat_id,
-                        status_msg.message_id,
-                        reply_markup=markup
-                    )
-                except Exception:
-                    pass
-                await asyncio.sleep(fwe.seconds)
-                advance = False
             except Exception as e:
-                err_msg = str(e).lower()
-                if any(x in err_msg for x in ["private", "permission", "ban", "forbidden", "access"]):
-                    logger.warning(f"⚠️ RELEASE: Message ID {smid} is inaccessible ({e}). Marking as failed/skipped.")
-                    try:
-                        with db_conn() as conn:
-                            c = conn.cursor()
-                            p = get_placeholder()
-                            c.execute(f"UPDATE collected_media SET released = 2 WHERE id = {p}", (row_id,))
-                            conn.commit()
-                    except Exception as db_err:
-                        logger.error(f"Failed to update inaccessible status in DB: {db_err}")
                 logger.error(f"Release error: {e}")
-                await asyncio.sleep(0.05)
-            finally:
-                if advance:
-                    idx += 1
 
-        bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items from {category_name} matching `{display_filter}`.")
+        bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items from {category_name}.")
     except Exception as e:
         logger.error(f"Global Release Error: {e}")
         bot.send_message(admin_chat_id, f"❌ Release Crashed: {e}")

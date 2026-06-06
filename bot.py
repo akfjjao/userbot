@@ -4873,7 +4873,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
     row = get_target_pair(pair_id)
     if not row: return
     
-    # Clean unpacking of the database row
+    # Meticulous structural unpacking of the configuration pair
     pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf = row
     collected = 0
     scanned = 0
@@ -4883,9 +4883,9 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
     if default_cf not in ["everything", "media", "text", "file"]:
         default_cf = "everything"
         
-    # Initialize UI metrics state tracker
+    # Standardize UI state control dictionary
     collection_options[task_key] = {
-        "instant_release": True,  # Forced true to ensure it runs download pipelines completely
+        "instant_release": True,  
         "instant_filter": "everything",
         "collect_filter": default_cf,
         "s_title": s_title,
@@ -4897,13 +4897,13 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
     
     status_msg = bot.send_message(
         admin_chat_id, 
-        f"📥 *Collection Engine Started: `{s_title}`*\n\n🔍 Scanned: `0`\n📥 Collected: `0`\n📤 Sent: `0`", 
+        f"📥 *Collection Pipeline Initialized: `{s_title}`*\n\n🔍 Scanned: `0`\n📥 Isolated: `0`\n📤 Dispatched to Target: `0`", 
         reply_markup=get_collection_markup(pair_id), 
         parse_mode="Markdown"
     )
     
     try:
-        logger.info(f"PIPELINE-COLLECT: Resolving source {sid} and target {tid}")
+        logger.info(f"PIPELINE-COLLECT: Targeting source chat {sid} -> destination group {tid}")
         source_chat = await resolve_target_id(userbot, sid)
         sid_resolved = source_chat.id
         
@@ -4918,9 +4918,9 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         collected_messages = []
         is_protected_flow = getattr(source_chat, 'noforwards', False)
         
-        logger.info(f"PIPELINE-COLLECT: Fetching messages. Protected status: {is_protected_flow}")
+        logger.info(f"PIPELINE-COLLECT: Scrape started over network. Restricted Layer: {is_protected_flow}")
         
-        # Pull messages sequentially (Iterates backwards natively)
+        # Pull messages from the network wire
         async for m in userbot.iter_messages(sid_resolved, limit=limit, reply_to=target_topic):
             if not running_tasks.get(task_key):
                 break
@@ -4945,26 +4945,26 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
             if scanned % 50 == 0:
                 try:
                     bot.edit_message_text(
-                        f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}`\n📤 Processing pipelines...",
+                        f"📥 *Collection: `{s_title}`*\n\n🔍 Scanned: `{scanned}`\n📥 Isolated: `{collected}`\n📤 Preparing batch synchronization maps...",
                         admin_chat_id, status_msg.message_id,
                         reply_markup=get_collection_markup(pair_id), parse_mode="Markdown"
                     )
                 except Exception: pass
             
-            # Anti-flood optimization step for high limit values (>1000)
-            if scanned % 200 == 0:
-                await asyncio.sleep(1.0)
+            # Controlled cooling loop to circumvent structural Peer Flood constraints on high counts
+            if scanned % 250 == 0:
+                await asyncio.sleep(1.2)
             else:
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.005)
 
         if not running_tasks.get(task_key):
             bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.")
             return
 
-        # Reverse to process oldest to newest (Chronological order)
+        # Restore chronological mapping alignment
         collected_messages.reverse()
         
-        # Safe consecutive bundle assembler (Guarantees Albums stay together)
+        # Perfect sequential array chunker for native Telegram album structures
         grouped_batches = []
         temp_group = []
         for m in collected_messages:
@@ -4984,7 +4984,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         if temp_group:
             grouped_batches.append(temp_group)
 
-        # Dispatch engine through mirror logic
+        # Dispatch engine through the mirror core
         for batch in grouped_batches:
             if not running_tasks.get(task_key):
                 break
@@ -4994,28 +4994,28 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 for msg in batch:
                     if msg.media:
                         try:
-                            # Strict custom timeout limits configuration for big assets download
-                            path = await asyncio.wait_for(userbot.download_media(msg), timeout=120)
+                            # Dynamic buffer stream allocation to read encrypted blocks directly
+                            path = await asyncio.wait_for(userbot.download_media(msg), timeout=90)
                             if path:
                                 media_to_file[msg.id] = path
                         except errors.FloodWaitError as fwe:
-                            logger.warning(f"⏳ FLOOD DELAY: Sleeping {fwe.seconds}s during mass download...")
+                            logger.warning(f"⏳ DC RATELIMIT: Encountered forced wait. Pausing execution loop for {fwe.seconds}s...")
                             await asyncio.sleep(fwe.seconds)
                             try:
                                 path = await userbot.download_media(msg)
                                 if path: media_to_file[msg.id] = path
                             except Exception: pass
                         except Exception as e:
-                            logger.error(f"Failed asset download override: {e}")
+                            logger.error(f"Media extraction dropped inside target pair buffer: {e}")
 
             try:
                 has_media = any(msg.media for msg in batch)
                 sent_msg = None
                 
-                # Execute mirror module mapping
+                # Forward or download/upload via custom mirroring array block map
                 if is_protected_flow and has_media:
                     if len(media_to_file) == 0:
-                        logger.warning("🛡️ Engine fallback skipped: No structural media successfully downloaded.")
+                        logger.warning("🛡️ Pipeline skip: Missing localized local file paths for content payload.")
                         continue
                     sent_msg = await send_mirrored_content(
                         userbot, tid_resolved, batch, t_topic, bool(is_mir), sid_resolved, 
@@ -5029,7 +5029,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 if sent_msg:
                     sent_count += len(batch)
                     
-                    # Log mapping to local Database storage structure
+                    # Log to database structures inside thread pools safely
                     with db_conn() as conn:
                         c = conn.cursor()
                         for m in batch:
@@ -5046,34 +5046,35 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 )
                         conn.commit()
 
-                # Dynamic throttle adjustment based on cluster volume size
-                if len(batch) > 3:
-                    await asyncio.sleep(3.5)  # Larger albums need extra rate limit protection
+                # Album structure network pacing adjustment
+                if len(batch) > 1:
+                    await asyncio.sleep(2.5)  
                 else:
-                    await asyncio.sleep(1.8)
+                    await asyncio.sleep(1.0)
 
-                # Push visual updates to Console
+                # Push execution dashboard metrics to user interface
                 try:
                     bot.edit_message_text(
-                        f"📥 *Collection Active: `{s_title}`*\n\n🔍 Total Scanned: `{scanned}`\n📥 Successfully Processed: `{sent_count}` items",
+                        f"📥 *Collection Live: `{s_title}`*\n\n🔍 Total Scanned: `{scanned}`\n📥 Successfully Processed: `{sent_count}` items",
                         admin_chat_id, status_msg.message_id,
                         reply_markup=get_collection_markup(pair_id), parse_mode="Markdown"
                     )
                 except Exception: pass
 
             finally:
-                # Clean file buffers instantly to prevent container memory leak crash on Render
+                # Garbage clear routine to shield runtime environments from low RAM reboots
                 for temp_path in list(media_to_file.values()):
                     if temp_path and os.path.exists(temp_path):
                         try: os.remove(temp_path)
                         except Exception: pass
 
-        bot.send_message(admin_chat_id, f"✅ **Collection Core Complete!**\nGroup: `{s_title}`\nScanned items: `{scanned}`\nMirrored seamlessly: `{sent_count}`")
+        bot.send_message(admin_chat_id, f"✅ **Collection Session Finalized!**\nGroup: `{s_title}`\nScanned count: `{scanned}`\nDispatched sequentially: `{sent_count}` items")
     except Exception as e:
-        logger.error(f"Global collection engine crashed: {e}")
-        bot.send_message(admin_chat_id, f"❌ Engine fault alert: {e}")
+        logger.error(f"Global collection task failure: {e}")
+        bot.send_message(admin_chat_id, f"❌ Pipeline exception crash: {e}")
     finally:
         running_tasks.pop(task_key, None)
+        collection_options.pop(task_key, None)
 
 async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, release_filter="everything"):
     is_ok, msg = await ensure_userbot()
